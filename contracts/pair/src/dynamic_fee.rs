@@ -6,6 +6,15 @@ use soroban_sdk::Env;
 /// Fixed-point scale factor (1e14) — must match `math::SCALE`.
 const SCALE: i128 = 100_000_000_000_000;
 
+/// Default EMA staleness decay threshold in ledgers.
+///
+/// When a pool's EMA has not been updated for this many ledgers,
+/// the volatility accumulator begins exponential time decay. This prevents
+/// idle pools from charging inflated fees.
+///
+/// Default value: 100 ledgers (~8.3 minutes at Stellar's ~5s/ledger cadence).
+pub const DEFAULT_STALE_LEDGER_THRESHOLD: u32 = 100;
+
 /// Updates the EMA volatility accumulator with a new price observation.
 ///
 /// Uses size-weighted EMA so that large trades move the accumulator more than
@@ -28,6 +37,11 @@ pub fn update_volatility(
     // --- Input validation ---------------------------------------------------
     if price_delta_abs < 0 || trade_size <= 0 || total_reserve <= 0 {
         return Err(PairError::InvalidInput);
+    }
+
+    // EMA alpha must be in [0, SCALE] to ensure the weight split is valid.
+    if fee_state.ema_alpha < 0 || fee_state.ema_alpha > SCALE {
+        return Err(PairError::InvalidEmaAlpha);
     }
 
     // --- Size-weighted observation ------------------------------------------
@@ -59,6 +73,19 @@ pub fn update_volatility(
         .ok_or(PairError::Overflow)?
         .checked_div(SCALE)
         .ok_or(PairError::Overflow)?;
+
+    // --- Cap accumulator to prevent unbounded growth -------------------------
+    // Compute the accumulator value that produces max_fee_bps and clamp to it.
+    // This ensures the dynamic fee can recover normally via time decay instead
+    // of being pegged at maximum indefinitely after a griefing attack.
+    if fee_state.ramp_up_multiplier > 0 {
+        let scale_to_bps = SCALE / 10_000;
+        let fee_headroom =
+            (fee_state.max_fee_bps as i128).saturating_sub(fee_state.baseline_fee_bps as i128);
+        let max_vol =
+            fee_headroom.saturating_mul(scale_to_bps) / (fee_state.ramp_up_multiplier as i128);
+        fee_state.vol_accumulator = fee_state.vol_accumulator.min(max_vol);
+    }
 
     // --- Timestamp ----------------------------------------------------------
     fee_state.last_fee_update = env.ledger().timestamp();
@@ -98,10 +125,14 @@ pub fn compute_fee_bps(fee_state: &FeeState) -> u32 {
 }
 
 /// Decays the volatility accumulator if the pool has been idle.
+///
+/// Uses the configurable `stale_threshold` field to determine when
+/// the pool should begin time-based decay. The threshold can be updated
+/// via `Pair::set_stale_threshold()` (factory-admin-gated).
 pub fn decay_stale_ema(env: &Env, fee_state: &mut FeeState) {
     let current_ledger = env.ledger().sequence() as u64;
 
-    if current_ledger > fee_state.last_fee_update + fee_state.decay_threshold_blocks {
+    if current_ledger > fee_state.last_fee_update + (fee_state.stale_threshold as u64) {
         apply_time_decay(env, fee_state, current_ledger);
     }
 }
@@ -126,6 +157,7 @@ mod tests {
             cooldown_divisor: 2,
             last_fee_update: 0,
             decay_threshold_blocks: 100,
+            stale_threshold: DEFAULT_STALE_LEDGER_THRESHOLD,
         }
     }
 
@@ -304,7 +336,48 @@ mod tests {
         assert_eq!(result, Err(PairError::InvalidInput));
     }
 
+    // ------ Accumulator cap ---------------------------------------------------
+
+    #[test]
+    fn vol_accumulator_capped_at_max_fee_level() {
+        let env = Env::default();
+        let alpha = SCALE; // 100% — instant replacement
+        let mut state = default_fee_state(alpha);
+
+        // Repeatedly feed huge price deltas to try to blow up the accumulator.
+        for _ in 0..100 {
+            update_volatility(&env, &mut state, 1_000_000, 1_000_000, 1_000_000).unwrap();
+        }
+
+        // Fee should never exceed max_fee_bps
+        let fee = compute_fee_bps(&state);
+        assert!(
+            fee <= state.max_fee_bps,
+            "fee {} must not exceed max_fee_bps {}",
+            fee,
+            state.max_fee_bps,
+        );
+    }
+
     // ------ Alpha edge cases -------------------------------------------------
+
+    #[test]
+    fn alpha_above_scale_returns_error() {
+        let env = Env::default();
+        let mut state = default_fee_state(SCALE + 1);
+
+        let result = update_volatility(&env, &mut state, 100, 1_000, 1_000_000);
+        assert_eq!(result, Err(PairError::InvalidEmaAlpha));
+    }
+
+    #[test]
+    fn negative_alpha_returns_error() {
+        let env = Env::default();
+        let mut state = default_fee_state(-1);
+
+        let result = update_volatility(&env, &mut state, 100, 1_000, 1_000_000);
+        assert_eq!(result, Err(PairError::InvalidEmaAlpha));
+    }
 
     #[test]
     fn alpha_zero_means_no_update() {

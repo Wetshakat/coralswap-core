@@ -1,14 +1,17 @@
 #![cfg(test)]
 
+use crate::dynamic_fee::DEFAULT_STALE_LEDGER_THRESHOLD;
 use crate::storage::{FeeState, PairStorage};
 use crate::{Pair, PairClient};
 use soroban_sdk::{testutils::Address as _, testutils::Ledger, Address, Env};
 
 fn setup_test_env() -> (Env, PairClient<'static>) {
     let env = Env::default();
+    // BLANKET MOCK (issue #314): read-only view assertions, not authorization.
+    // Guards are covered by the per-contract `auth_matrix` module.
     env.mock_all_auths();
 
-    let pair_id = env.register_contract(None, Pair);
+    let pair_id = env.register(Pair, ());
     let client = PairClient::new(&env, &pair_id);
 
     (env, client)
@@ -27,9 +30,11 @@ fn test_get_reserves_uninitialized_panics() {
 #[test]
 fn test_get_reserves_initialized() {
     let env = Env::default();
+    // BLANKET MOCK (issue #314): read-only view assertions, not authorization.
+    // Guards are covered by the per-contract `auth_matrix` module.
     env.mock_all_auths();
 
-    let contract_id = env.register_contract(None, Pair);
+    let contract_id = env.register(Pair, ());
     let pair_client = PairClient::new(&env, &contract_id);
 
     let factory = Address::generate(&env);
@@ -59,9 +64,11 @@ fn test_get_current_fee_bps_uninitialized() {
 #[test]
 fn test_get_current_fee_bps_initialized_no_volatility() {
     let env = Env::default();
+    // BLANKET MOCK (issue #314): read-only view assertions, not authorization.
+    // Guards are covered by the per-contract `auth_matrix` module.
     env.mock_all_auths();
 
-    let contract_id = env.register_contract(None, Pair);
+    let contract_id = env.register(Pair, ());
     let pair_client = PairClient::new(&env, &contract_id);
 
     let factory = Address::generate(&env);
@@ -84,11 +91,13 @@ fn test_get_current_fee_bps_initialized_no_volatility() {
 #[test]
 fn test_get_reserves_after_state_change() {
     let env = Env::default();
+    // BLANKET MOCK (issue #314): read-only view assertions, not authorization.
+    // Guards are covered by the per-contract `auth_matrix` module.
     env.mock_all_auths();
 
     env.ledger().set_timestamp(12345);
 
-    let contract_id = env.register_contract(None, Pair);
+    let contract_id = env.register(Pair, ());
     let pair_client = PairClient::new(&env, &contract_id);
 
     // Direct state manipulation is cleaner for isolated testing of the view function without pulling in tokens.
@@ -101,8 +110,6 @@ fn test_get_reserves_after_state_change() {
         reserve_a: 1000,
         reserve_b: 2000,
         block_timestamp_last: 12345,
-        price_a_cumulative: 0,
-        price_b_cumulative: 0,
         k_last: 2000000,
     };
 
@@ -122,9 +129,11 @@ fn test_get_reserves_after_state_change() {
 #[test]
 fn test_get_current_fee_bps_with_state() {
     let env = Env::default();
+    // BLANKET MOCK (issue #314): read-only view assertions, not authorization.
+    // Guards are covered by the per-contract `auth_matrix` module.
     env.mock_all_auths();
 
-    let contract_id = env.register_contract(None, Pair);
+    let contract_id = env.register(Pair, ());
     let pair_client = PairClient::new(&env, &contract_id);
 
     let fee_state = FeeState {
@@ -137,6 +146,7 @@ fn test_get_current_fee_bps_with_state() {
         cooldown_divisor: 2,
         last_fee_update: 0,
         decay_threshold_blocks: 100,
+        stale_threshold: DEFAULT_STALE_LEDGER_THRESHOLD,
     };
 
     env.as_contract(&contract_id, || {
@@ -147,4 +157,49 @@ fn test_get_current_fee_bps_with_state() {
     // fee = 30 + (1e12 * 2) / 1e10 = 30 + 200 = 230 -> clamped to 100
     let fee = pair_client.get_current_fee_bps();
     assert_eq!(fee, 100);
+}
+
+#[test]
+fn test_get_fee_state_reports_model_version_and_bps() {
+    let env = Env::default();
+    // BLANKET MOCK (issue #314): read-only view assertions, not authorization.
+    // Guards are covered by the per-contract `auth_matrix` module.
+    env.mock_all_auths();
+
+    let contract_id = env.register(Pair, ());
+    let pair_client = PairClient::new(&env, &contract_id);
+
+    pair_client.initialize(
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+    );
+
+    let view = pair_client.get_fee_state();
+    assert_eq!(view.fee_model_version, crate::FEE_MODEL_VERSION);
+    assert_eq!(view.current_fee_bps, pair_client.get_current_fee_bps());
+    assert_eq!(view.baseline_fee_bps, 30);
+    assert_eq!(view.min_fee_bps, 10);
+    assert_eq!(view.max_fee_bps, 100);
+}
+
+#[test]
+fn test_version_returns_protocol_constant() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let contract_id = env.register(Pair, ());
+    let pair_client = PairClient::new(&env, &contract_id);
+
+    pair_client.initialize(
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+        &Address::generate(&env),
+    );
+
+    // The pair's version is the shared implementation constant, not stored
+    // state (issue #383) — clients can verify it without any other view.
+    assert_eq!(pair_client.version(), coralswap_shared::PROTOCOL_VERSION);
 }

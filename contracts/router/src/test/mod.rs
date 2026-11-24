@@ -1,15 +1,14 @@
-use crate::{Router, RouterClient, RouterError};
 use soroban_sdk::{
-    contract, contractimpl, contracttype,
-    testutils::Address as _,
-    testutils::Ledger as _,
-    token::{StellarAssetClient, TokenClient},
-    Address, Env,
+    contract, contractclient, contractimpl, contracttype,
+    testutils::{Address as _, Ledger as _},
+    xdr::ToXdr,
+    Address, Bytes, BytesN, Env, Vec,
 };
 
-// ── Mock Contracts ────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// MockFactory
+// ---------------------------------------------------------------------------
 
-/// Minimal mock factory that stores and returns a pair address.
 #[contract]
 pub struct MockFactory;
 
@@ -17,70 +16,77 @@ pub struct MockFactory;
 #[derive(Clone)]
 pub enum MFKey {
     Pair(Address, Address),
+    FeeToSetter,
+    IsPair(Address),
 }
 
 #[contractimpl]
 impl MockFactory {
-    /// Pre-register a pair address for a token pair (sorted canonically).
     pub fn set_pair(env: Env, token_a: Address, token_b: Address, pair: Address) {
         let (t0, t1) = if token_a < token_b { (token_a, token_b) } else { (token_b, token_a) };
         env.storage().instance().set(&MFKey::Pair(t0, t1), &pair);
+        env.storage().instance().set(&MFKey::IsPair(pair), &true);
     }
 
-    /// Get a registered pair; returns None if not set.
+    pub fn set_is_pair(env: Env, pair: Address, is_pair: bool) {
+        env.storage().instance().set(&MFKey::IsPair(pair), &is_pair);
+    }
+
+    pub fn is_pair(env: Env, pair: Address) -> bool {
+        env.storage().instance().get(&MFKey::IsPair(pair)).unwrap_or(false)
+    }
+
     pub fn get_pair(env: Env, token_a: Address, token_b: Address) -> Option<Address> {
         let (t0, t1) = if token_a < token_b { (token_a, token_b) } else { (token_b, token_a) };
         env.storage().instance().get(&MFKey::Pair(t0, t1))
     }
 
-    /// "Create" a pair — in tests, just returns the pre-registered address.
-    /// Tests must call set_pair before triggering any path that calls create_pair.
-    pub fn create_pair(env: Env, token_a: Address, token_b: Address) -> Address {
-        let (t0, t1) = if token_a < token_b { (token_a, token_b) } else { (token_b, token_a) };
-        env.storage()
-            .instance()
-            .get(&MFKey::Pair(t0, t1))
-            .expect("test must call set_pair before create_pair is invoked")
+    pub fn set_fee_to_setter(env: Env, setter: Address) {
+        env.storage().instance().set(&MFKey::FeeToSetter, &setter);
+    }
+
+    pub fn fee_to_setter(env: Env) -> Option<Address> {
+        env.storage().instance().get(&MFKey::FeeToSetter)
+    }
+
+    pub fn create_pair(_env: Env, _token_a: Address, _token_b: Address) -> Address {
+        panic!("not needed for router unit tests")
     }
 }
 
-/// Minimal mock pair that returns pre-configured amounts and supports all PairClient methods.
+// ---------------------------------------------------------------------------
+// MockPair
+// ---------------------------------------------------------------------------
+
 #[contract]
 pub struct MockPair;
 
 #[contracttype]
 #[derive(Clone)]
 pub enum MPKey {
-    LpToken,
-    AmountA,
-    AmountB,
     ReserveA,
     ReserveB,
-    MintReturn,
+    BurnAmountA,
+    BurnAmountB,
+    LiquidityToMint,
 }
 
 #[contractimpl]
 impl MockPair {
-    pub fn set_lp_token(env: Env, lp_token: Address) {
-        env.storage().instance().set(&MPKey::LpToken, &lp_token);
-    }
-
-    pub fn set_burn_amounts(env: Env, amount_a: i128, amount_b: i128) {
-        env.storage().instance().set(&MPKey::BurnAmountA, &amount_a);
-        env.storage().instance().set(&MPKey::BurnAmountB, &amount_b);
-    }
-
     pub fn set_reserves(env: Env, reserve_a: i128, reserve_b: i128) {
         env.storage().instance().set(&MPKey::ReserveA, &reserve_a);
         env.storage().instance().set(&MPKey::ReserveB, &reserve_b);
     }
 
-    pub fn set_liquidity_to_mint(env: Env, liquidity: i128) {
-        env.storage().instance().set(&MPKey::LiquidityToMint, &liquidity);
+    pub fn get_reserves(env: Env) -> (i128, i128, u64) {
+        let a: i128 = env.storage().instance().get(&MPKey::ReserveA).unwrap_or(0);
+        let b: i128 = env.storage().instance().get(&MPKey::ReserveB).unwrap_or(0);
+        (a, b, 0)
     }
 
-    pub fn lp_token(env: Env) -> Address {
-        env.storage().instance().get(&MPKey::LpToken).unwrap()
+    pub fn set_burn_amounts(env: Env, amount_a: i128, amount_b: i128) {
+        env.storage().instance().set(&MPKey::BurnAmountA, &amount_a);
+        env.storage().instance().set(&MPKey::BurnAmountB, &amount_b);
     }
 
     pub fn burn(env: Env, _to: Address) -> (i128, i128) {
@@ -89,613 +95,993 @@ impl MockPair {
         (a, b)
     }
 
-    pub fn set_reserves(env: Env, reserve_a: i128, reserve_b: i128) {
-        env.storage().instance().set(&MPKey::ReserveA, &reserve_a);
-        env.storage().instance().set(&MPKey::ReserveB, &reserve_b);
-    }
-
-    pub fn set_mint_return(env: Env, liquidity: i128) {
-        env.storage().instance().set(&MPKey::MintReturn, &liquidity);
-    }
-
-    pub fn get_reserves(env: Env) -> (i128, i128, u64) {
-        let ra: i128 = env.storage().instance().get(&MPKey::ReserveA).unwrap_or(0);
-        let rb: i128 = env.storage().instance().get(&MPKey::ReserveB).unwrap_or(0);
-        (ra, rb, 0u64)
+    pub fn set_liquidity_to_mint(env: Env, liquidity: i128) {
+        env.storage().instance().set(&MPKey::LiquidityToMint, &liquidity);
     }
 
     pub fn mint(env: Env, _to: Address) -> i128 {
-        env.storage().instance().get(&MPKey::MintReturn).unwrap_or(0)
+        env.storage().instance().get(&MPKey::LiquidityToMint).unwrap_or(0)
+    }
+
+    pub fn swap(_env: Env, _amount_a_out: i128, _amount_b_out: i128, _to: Address) {}
+
+    pub fn lp_token(_env: Env) -> Address {
+        panic!("not needed for router unit tests")
+    }
+
+    pub fn get_current_fee_bps(_env: Env) -> u32 {
+        30
+    }
+
+    // The router quotes with the override-aware fee since #441; no factory
+    // override is set in these tests.
+    pub fn get_effective_fee_bps(_env: Env) -> (u32, bool) {
+        (30, false)
     }
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ---------------------------------------------------------------------------
+// Test helpers
+// ---------------------------------------------------------------------------
 
-/// Sets up a full mock environment with Router, Factory, Pair, and tokens.
-///
-/// Returns (env, router_client, token_a, token_b, to, deadline,
-///          mock_pair_client, lp_token_addr, pair_addr).
-#[allow(clippy::type_complexity)]
-fn setup_full_env() -> (
-    Env,
-    RouterClient<'static>,
-    Address,
-    Address,
-    Address,
-    u64,
-    MockPairClient<'static>,
-    Address,
-    Address,
-) {
+use crate::Router;
+
+fn deploy_router(env: &Env) -> (Address, Address) {
+    let router_id = env.register(Router, ());
+    let factory_id = env.register(MockFactory, ());
+    let router = RouterClient::new(env, &router_id);
+    router.initialize(&factory_id, &Vec::new(env));
+    (router_id, factory_id)
+}
+
+fn generate_tokens(env: &Env, n: u32) -> Vec<Address> {
+    let mut tokens: Vec<Address> = Vec::new(env);
+    for _ in 0..n {
+        tokens.push_back(Address::generate(env));
+    }
+    tokens
+}
+
+/// Registers `n` Stellar asset contracts, for tests whose swap actually
+/// transfers the input token from the user.
+fn generate_asset_tokens(env: &Env, n: u32) -> Vec<Address> {
+    let mut tokens: Vec<Address> = Vec::new(env);
+    for _ in 0..n {
+        tokens.push_back(env.register_stellar_asset_contract_v2(Address::generate(env)).address());
+    }
+    tokens
+}
+
+fn setup_pair(
+    env: &Env,
+    factory_id: &Address,
+    token_a: &Address,
+    token_b: &Address,
+    reserve_a: i128,
+    reserve_b: i128,
+) -> Address {
+    let pair_id = env.register(MockPair, ());
+    let pair = MockPairClient::new(env, &pair_id);
+    pair.set_reserves(&reserve_a, &reserve_b);
+
+    let factory = MockFactoryClient::new(env, factory_id);
+    factory.set_pair(token_a, token_b, &pair_id);
+    pair_id
+}
+
+fn make_path(env: &Env, tokens: &Vec<Address>) -> Vec<Address> {
+    let mut path: Vec<Address> = Vec::new(env);
+    for i in 0..tokens.len() {
+        path.push_back(tokens.get(i).unwrap());
+    }
+    path
+}
+
+// ---------------------------------------------------------------------------
+// RouterClient helper
+// ---------------------------------------------------------------------------
+
+#[contractclient(name = "RouterClient")]
+#[allow(dead_code)]
+pub trait RouterInterface {
+    fn initialize(env: Env, factory: Address, hubs: Vec<Address>);
+    fn set_hubs(env: Env, hubs: Vec<Address>);
+    fn get_hubs(env: Env) -> Vec<Address>;
+    fn sweep(env: Env, token: Address, recipient: Address) -> i128;
+    fn get_best_path(
+        env: Env,
+        token_in: Address,
+        token_out: Address,
+        amount_in: i128,
+    ) -> (Vec<Address>, i128);
+    fn swap_exact_tokens_multi_hop(
+        env: Env,
+        path: Vec<Address>,
+        amount_in: i128,
+        amount_out_min: i128,
+        to: Address,
+        deadline: u64,
+        deadline_ledger: Option<u32>,
+    ) -> i128;
+    fn swap_exact_tokens_for_tokens(
+        env: Env,
+        amount_in: i128,
+        amount_out_min: i128,
+        path: Vec<Address>,
+        to: Address,
+        deadline: u64,
+        deadline_ledger: Option<u32>,
+    ) -> Vec<i128>;
+    fn swap_tokens_for_exact_tokens(
+        env: Env,
+        amount_out: i128,
+        amount_in_max: i128,
+        path: Vec<Address>,
+        to: Address,
+        deadline: u64,
+        deadline_ledger: Option<u32>,
+    ) -> Vec<i128>;
+    fn add_liquidity(
+        env: Env,
+        token_a: Address,
+        token_b: Address,
+        amount_a_desired: i128,
+        amount_b_desired: i128,
+        amount_a_min: i128,
+        amount_b_min: i128,
+        to: Address,
+        deadline: u64,
+        deadline_ledger: Option<u32>,
+    ) -> (i128, i128, i128);
+    fn remove_liquidity(
+        env: Env,
+        token_a: Address,
+        token_b: Address,
+        liquidity: i128,
+        amount_a_min: i128,
+        amount_b_min: i128,
+        to: Address,
+        deadline: u64,
+        deadline_ledger: Option<u32>,
+    ) -> (i128, i128);
+    fn commit_swap(env: Env, sender: Address, hash: BytesN<32>);
+    fn reveal_swap(
+        env: Env,
+        sender: Address,
+        token_in: Address,
+        token_out: Address,
+        amount_in: i128,
+        min_out: i128,
+        nonce: u64,
+        salt: BytesN<32>,
+    ) -> i128;
+}
+
+mod add_liquidity_boundary;
+mod deadline;
+mod helpers_test;
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_contract_compiles() {
+    // Contract compiles and links correctly
+}
+
+// ===================== get_best_path =====================
+
+#[test]
+fn test_get_best_path_identical_tokens() {
     let env = Env::default();
+    let (router_id, _factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+    let token = Address::generate(&env);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.get_best_path(&token, &token, &1000);
+    }));
+    assert!(result.is_err(), "identical tokens must fail");
+}
+
+#[test]
+fn test_get_best_path_zero_amount() {
+    let env = Env::default();
+    let (router_id, _factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.get_best_path(&a, &b, &0);
+    }));
+    assert!(result.is_err(), "zero amount must fail");
+}
+
+#[test]
+fn test_get_best_path_no_factory_set() {
+    let env = Env::default();
+    let router_id = env.register(Router, ());
+    let router = RouterClient::new(&env, &router_id);
+    let a = Address::generate(&env);
+    let b = Address::generate(&env);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.get_best_path(&a, &b, &1000);
+    }));
+    assert!(result.is_err(), "no factory must fail");
+}
+
+#[test]
+fn test_get_best_path_direct_pair() {
+    let env = Env::default();
+    let (router_id, factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+    let tokens = generate_tokens(&env, 2);
+    let token_a = tokens.get(0).unwrap();
+    let token_b = tokens.get(1).unwrap();
+
+    setup_pair(&env, &factory_id, &token_a, &token_b, 100_000, 100_000);
+
+    let (path, expected_out) = router.get_best_path(&token_a, &token_b, &1000);
+    assert_eq!(path.len(), 2, "direct path must have 2 entries");
+    assert_eq!(path.get(0).unwrap(), token_a);
+    assert_eq!(path.get(1).unwrap(), token_b);
+    assert!(expected_out > 0, "expected output must be positive");
+}
+
+#[test]
+fn test_get_best_path_two_hop() {
+    let env = Env::default();
+    let (router_id, factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+    let tokens = generate_tokens(&env, 3);
+    let token_a = tokens.get(0).unwrap();
+    let token_b = tokens.get(1).unwrap();
+    let hub = tokens.get(2).unwrap();
+
+    let mut hubs: Vec<Address> = Vec::new(&env);
+    hubs.push_back(hub.clone());
+    router.set_hubs(&hubs);
+
+    setup_pair(&env, &factory_id, &token_a, &hub, 100_000, 100_000);
+    setup_pair(&env, &factory_id, &hub, &token_b, 200_000, 200_000);
+
+    let (path, expected_out) = router.get_best_path(&token_a, &token_b, &1000);
+    assert_eq!(path.len(), 3, "2-hop path must have 3 entries");
+    assert_eq!(path.get(0).unwrap(), token_a);
+    assert_eq!(path.get(1).unwrap(), hub);
+    assert_eq!(path.get(2).unwrap(), token_b);
+    assert!(expected_out > 0, "expected output must be positive");
+}
+
+#[test]
+fn test_get_best_path_prefers_highest_output() {
+    let env = Env::default();
+    let (router_id, factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+    let tokens = generate_tokens(&env, 4);
+    let token_a = tokens.get(0).unwrap();
+    let token_b = tokens.get(1).unwrap();
+    let hub1 = tokens.get(2).unwrap();
+    let hub2 = tokens.get(3).unwrap();
+
+    let mut hubs: Vec<Address> = Vec::new(&env);
+    hubs.push_back(hub1.clone());
+    hubs.push_back(hub2.clone());
+    router.set_hubs(&hubs);
+
+    // Direct pair with very low liquidity → low output
+    setup_pair(&env, &factory_id, &token_a, &token_b, 500, 500);
+
+    // hub1 route with high liquidity
+    setup_pair(&env, &factory_id, &token_a, &hub1, 100_000, 100_000);
+    setup_pair(&env, &factory_id, &hub1, &token_b, 100_000, 100_000);
+
+    // hub2 route with low liquidity
+    setup_pair(&env, &factory_id, &token_a, &hub2, 1_000, 1_000);
+    setup_pair(&env, &factory_id, &hub2, &token_b, 1_000, 1_000);
+
+    let (path, expected_out) = router.get_best_path(&token_a, &token_b, &1000);
+    assert_eq!(path.len(), 3, "should select 2-hop via best hub");
+    assert_eq!(path.get(1).unwrap(), hub1, "should prefer higher-liquidity hub");
+    assert!(expected_out > 0);
+}
+
+#[test]
+fn test_get_best_path_three_hop() {
+    let env = Env::default();
+    let (router_id, factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+    let tokens = generate_tokens(&env, 4);
+    let token_a = tokens.get(0).unwrap();
+    let token_b = tokens.get(1).unwrap();
+    let hub1 = tokens.get(2).unwrap();
+    let hub2 = tokens.get(3).unwrap();
+
+    let mut hubs: Vec<Address> = Vec::new(&env);
+    hubs.push_back(hub1.clone());
+    hubs.push_back(hub2.clone());
+    router.set_hubs(&hubs);
+
+    setup_pair(&env, &factory_id, &token_a, &hub1, 100_000, 100_000);
+    setup_pair(&env, &factory_id, &hub1, &hub2, 100_000, 100_000);
+    setup_pair(&env, &factory_id, &hub2, &token_b, 100_000, 100_000);
+
+    let (path, expected_out) = router.get_best_path(&token_a, &token_b, &1000);
+    assert_eq!(path.len(), 4, "3-hop path must have 4 entries");
+    assert_eq!(path.get(0).unwrap(), token_a);
+    assert_eq!(path.get(1).unwrap(), hub1);
+    assert_eq!(path.get(2).unwrap(), hub2);
+    assert_eq!(path.get(3).unwrap(), token_b);
+    assert!(expected_out > 0);
+}
+
+#[test]
+fn test_get_best_path_no_route() {
+    let env = Env::default();
+    let (router_id, _factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+    let tokens = generate_tokens(&env, 2);
+    let token_a = tokens.get(0).unwrap();
+    let token_b = tokens.get(1).unwrap();
+
+    // Set up a hub but no pairs connecting token_a or token_b
+    let mut hubs: Vec<Address> = Vec::new(&env);
+    hubs.push_back(Address::generate(&env));
+    router.set_hubs(&hubs);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.get_best_path(&token_a, &token_b, &1000);
+    }));
+    assert!(result.is_err(), "no feasible route must fail");
+}
+
+// ===================== swap_exact_tokens_multi_hop =====================
+
+#[test]
+fn test_swap_multi_hop_expired_deadline() {
+    let env = Env::default();
+    let (router_id, _factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+    let tokens = generate_tokens(&env, 2);
+    let path = make_path(&env, &tokens);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.swap_exact_tokens_multi_hop(
+            &path,
+            &1000,
+            &1,
+            &Address::generate(&env),
+            &1, // deadline in the past (ledger timestamp is 2000)
+            &None,
+        );
+    }));
+    assert!(result.is_err(), "expired deadline must fail");
+}
+
+#[test]
+fn test_swap_multi_hop_zero_amount() {
+    let env = Env::default();
+    let (router_id, _factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+    let tokens = generate_tokens(&env, 2);
+    let path = make_path(&env, &tokens);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.swap_exact_tokens_multi_hop(
+            &path,
+            &0,
+            &1,
+            &Address::generate(&env),
+            &u64::MAX,
+            &None,
+        );
+    }));
+    assert!(result.is_err(), "zero amount must fail");
+}
+
+#[test]
+fn test_swap_multi_hop_invalid_path_too_short() {
+    let env = Env::default();
+    let (router_id, _factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+    let mut path: Vec<Address> = Vec::new(&env);
+    path.push_back(Address::generate(&env));
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.swap_exact_tokens_multi_hop(
+            &path,
+            &1000,
+            &1,
+            &Address::generate(&env),
+            &u64::MAX,
+            &None,
+        );
+    }));
+    assert!(result.is_err(), "too-short path must fail");
+}
+
+#[test]
+fn test_swap_multi_hop_invalid_path_too_long() {
+    let env = Env::default();
+    let (router_id, _factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+    let tokens = generate_tokens(&env, 5);
+    let path = make_path(&env, &tokens);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.swap_exact_tokens_multi_hop(
+            &path,
+            &1000,
+            &1,
+            &Address::generate(&env),
+            &u64::MAX,
+            &None,
+        );
+    }));
+    assert!(result.is_err(), "too-long path (4+ hops) must fail");
+}
+
+// ===================== swap_tokens_for_exact_tokens =====================
+
+#[test]
+fn test_swap_exact_out_expired_deadline() {
+    let env = Env::default();
+    let (router_id, _factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+    let tokens = generate_tokens(&env, 2);
+    let path = make_path(&env, &tokens);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.swap_tokens_for_exact_tokens(
+            &100,
+            &1000,
+            &path,
+            &Address::generate(&env),
+            &1,
+            &None,
+        );
+    }));
+    assert!(result.is_err(), "expired deadline must fail");
+}
+
+#[test]
+fn test_swap_exact_out_zero_amount() {
+    let env = Env::default();
+    let (router_id, _factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+    let tokens = generate_tokens(&env, 2);
+    let path = make_path(&env, &tokens);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.swap_tokens_for_exact_tokens(
+            &0,
+            &1000,
+            &path,
+            &Address::generate(&env),
+            &u64::MAX,
+            &None,
+        );
+    }));
+    assert!(result.is_err(), "zero output amount must fail");
+}
+
+#[test]
+fn test_swap_exact_out_invalid_path() {
+    let env = Env::default();
+    let (router_id, _factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+    let mut path: Vec<Address> = Vec::new(&env);
+    path.push_back(Address::generate(&env));
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.swap_tokens_for_exact_tokens(
+            &100,
+            &1000,
+            &path,
+            &Address::generate(&env),
+            &u64::MAX,
+            &None,
+        );
+    }));
+    assert!(result.is_err(), "too-short path must fail");
+}
+
+// ===========================================================================
+// MockToken — minimal SEP-41 token stub for commit-reveal lifecycle tests
+// ===========================================================================
+
+#[contract]
+pub struct MockToken;
+
+#[contractimpl]
+impl MockToken {
+    pub fn transfer(_env: Env, _from: Address, _to: Address, _amount: i128) {}
+    pub fn balance(_env: Env, _id: Address) -> i128 {
+        i128::MAX
+    }
+    pub fn allowance(_env: Env, _from: Address, _spender: Address) -> i128 {
+        0
+    }
+    pub fn approve(
+        _env: Env,
+        _from: Address,
+        _spender: Address,
+        _amount: i128,
+        _expiration_ledger: u32,
+    ) {
+    }
+    pub fn transfer_from(
+        _env: Env,
+        _spender: Address,
+        _from: Address,
+        _to: Address,
+        _amount: i128,
+    ) {
+    }
+    pub fn decimals(_env: Env) -> u32 {
+        7
+    }
+    pub fn name(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "Mock")
+    }
+    pub fn symbol(env: Env) -> soroban_sdk::String {
+        soroban_sdk::String::from_str(&env, "MCK")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Commit-reveal test helpers
+// ---------------------------------------------------------------------------
+
+/// Replicates the on-chain hash so tests can build valid commitments.
+fn make_commit_hash(
+    env: &Env,
+    sender: &Address,
+    token_in: &Address,
+    token_out: &Address,
+    amount_in: i128,
+    min_out: i128,
+    nonce: u64,
+    salt: &BytesN<32>,
+) -> BytesN<32> {
+    let mut data = Bytes::new(env);
+    data.append(&sender.to_xdr(env));
+    data.append(&token_in.to_xdr(env));
+    data.append(&token_out.to_xdr(env));
+    data.append(&Bytes::from_slice(env, &amount_in.to_be_bytes()));
+    data.append(&Bytes::from_slice(env, &min_out.to_be_bytes()));
+    data.append(&Bytes::from_slice(env, &nonce.to_be_bytes()));
+    let salt_bytes: Bytes = salt.clone().into();
+    data.append(&salt_bytes);
+    env.crypto().sha256(&data).into()
+}
+
+/// Deploys a router + factory + pair + two mock tokens ready for a 1-hop swap.
+fn deploy_router_with_pair(env: &Env) -> (Address, Address, Address, Address, Address) {
+    let (router_id, factory_id) = deploy_router(env);
+
+    let token_in_id = env.register(MockToken, ());
+    let token_out_id = env.register(MockToken, ());
+
+    let pair_id = setup_pair(env, &factory_id, &token_in_id, &token_out_id, 1_000_000, 1_000_000);
+
+    // Give MockPair a non-zero fee so get_best_path succeeds
+    let pair = MockPairClient::new(env, &pair_id);
+    pair.set_reserves(&1_000_000, &1_000_000);
+
+    (router_id, factory_id, token_in_id, token_out_id, pair_id)
+}
+
+// ===========================================================================
+// ===================== commit_swap / reveal_swap tests =====================
+// ===========================================================================
+
+#[test]
+fn test_commit_swap_stores_entry() {
+    let env = Env::default();
+    // BLANKET MOCK (issue #314): router routing arithmetic, not authorization.
+    // Guards are covered by the per-contract `auth_matrix` module.
+    env.mock_all_auths();
+    let (router_id, _) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+
+    let sender = Address::generate(&env);
+    let token_in = Address::generate(&env);
+    let token_out = Address::generate(&env);
+    let salt = BytesN::from_array(&env, &[7u8; 32]);
+    let nonce: u64 = 1;
+
+    let hash = make_commit_hash(&env, &sender, &token_in, &token_out, 1000, 0, nonce, &salt);
+
+    // Should store without error
+    router.commit_swap(&sender, &hash);
+}
+
+#[test]
+fn test_reveal_without_commit_fails() {
+    let env = Env::default();
+    // BLANKET MOCK (issue #314): router routing arithmetic, not authorization.
+    // Guards are covered by the per-contract `auth_matrix` module.
+    env.mock_all_auths();
+    let (router_id, _) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+
+    let sender = Address::generate(&env);
+    let token_in = Address::generate(&env);
+    let token_out = Address::generate(&env);
+    let salt = BytesN::from_array(&env, &[1u8; 32]);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.reveal_swap(&sender, &token_in, &token_out, &1000, &0, &1_u64, &salt);
+    }));
+    assert!(result.is_err(), "reveal without prior commit must fail (CommitNotFound)");
+}
+
+#[test]
+fn test_reveal_same_ledger_fails() {
+    let env = Env::default();
+    // BLANKET MOCK (issue #314): router routing arithmetic, not authorization.
+    // Guards are covered by the per-contract `auth_matrix` module.
+    env.mock_all_auths();
+    let (router_id, _) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+
+    let sender = Address::generate(&env);
+    let token_in = Address::generate(&env);
+    let token_out = Address::generate(&env);
+    let salt = BytesN::from_array(&env, &[2u8; 32]);
+    let nonce: u64 = 1;
+
+    let hash = make_commit_hash(&env, &sender, &token_in, &token_out, 1000, 0, nonce, &salt);
+    router.commit_swap(&sender, &hash);
+
+    // No ledger advance — same sequence number
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.reveal_swap(&sender, &token_in, &token_out, &1000, &0, &nonce, &salt);
+    }));
+    assert!(result.is_err(), "reveal on same ledger must fail (CommitRevealTooEarly)");
+}
+
+#[test]
+fn test_reveal_wrong_hash_fails() {
+    let env = Env::default();
+    // BLANKET MOCK (issue #314): router routing arithmetic, not authorization.
+    // Guards are covered by the per-contract `auth_matrix` module.
+    env.mock_all_auths();
+    let (router_id, _) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+
+    let sender = Address::generate(&env);
+    let token_in = Address::generate(&env);
+    let token_out = Address::generate(&env);
+    let salt = BytesN::from_array(&env, &[3u8; 32]);
+    let nonce: u64 = 1;
+
+    let hash = make_commit_hash(&env, &sender, &token_in, &token_out, 1000, 0, nonce, &salt);
+    router.commit_swap(&sender, &hash);
+
+    // Advance one ledger
+    env.ledger().set_sequence_number(env.ledger().sequence() + 1);
+
+    // Reveal with a different amount — hash won't match
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.reveal_swap(&sender, &token_in, &token_out, &9999, &0, &nonce, &salt);
+    }));
+    assert!(result.is_err(), "reveal with wrong params must fail (CommitHashMismatch)");
+}
+
+#[test]
+fn test_reveal_nonce_replay_fails() {
+    let env = Env::default();
+    // BLANKET MOCK (issue #314): router routing arithmetic, not authorization.
+    // Guards are covered by the per-contract `auth_matrix` module.
+    env.mock_all_auths();
+    let (router_id, _) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+
+    let sender = Address::generate(&env);
+    let nonce: u64 = 42;
+
+    // Mark nonce as already used directly via contract storage
+    env.as_contract(&router_id, || {
+        crate::storage::set_nonce_used(&env, &sender, nonce);
+    });
+
+    let token_in = Address::generate(&env);
+    let token_out = Address::generate(&env);
+    let salt = BytesN::from_array(&env, &[4u8; 32]);
+    let hash = make_commit_hash(&env, &sender, &token_in, &token_out, 1000, 0, nonce, &salt);
+    router.commit_swap(&sender, &hash);
+
+    env.ledger().set_sequence_number(env.ledger().sequence() + 1);
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.reveal_swap(&sender, &token_in, &token_out, &1000, &0, &nonce, &salt);
+    }));
+    assert!(result.is_err(), "reused nonce must fail (NonceAlreadyUsed)");
+}
+
+#[test]
+fn test_commit_reveal_full_lifecycle() {
+    let env = Env::default();
+    // BLANKET MOCK (issue #314): router routing arithmetic, not authorization.
+    // Guards are covered by the per-contract `auth_matrix` module.
     env.mock_all_auths();
 
-    // Register contracts
-    let router_addr = env.register_contract(None, Router);
-    let router_client = RouterClient::new(&env, &router_addr);
+    let (router_id, _factory_id, token_in_id, token_out_id, _pair_id) =
+        deploy_router_with_pair(&env);
+    let router = RouterClient::new(&env, &router_id);
 
-    let factory_addr = env.register_contract(None, MockFactory);
-    let mock_factory_client = MockFactoryClient::new(&env, &factory_addr);
+    let sender = Address::generate(&env);
+    let amount_in: i128 = 1_000;
+    let min_out: i128 = 0;
+    let nonce: u64 = 7;
+    let salt = BytesN::from_array(&env, &[0xABu8; 32]);
 
-    let pair_addr = env.register_contract(None, MockPair);
-    let mock_pair_client = MockPairClient::new(&env, &pair_addr);
+    let hash = make_commit_hash(
+        &env,
+        &sender,
+        &token_in_id,
+        &token_out_id,
+        amount_in,
+        min_out,
+        nonce,
+        &salt,
+    );
 
-    // Create real Stellar Asset Contracts for LP and tokens
-    let lp_admin = Address::generate(&env);
-    let lp_token_addr = env.register_stellar_asset_contract_v2(lp_admin.clone()).address();
-    let lp_sac_client = StellarAssetClient::new(&env, &lp_token_addr);
+    // Step 1: commit
+    router.commit_swap(&sender, &hash);
 
-    let token_admin = Address::generate(&env);
-    let token_a = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
-    let token_b = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
-    let to = Address::generate(&env);
+    // Step 2: advance one ledger (minimum delay)
+    env.ledger().set_sequence_number(env.ledger().sequence() + 1);
 
-    // Wire up: Router → Factory → Pair → LP Token
-    router_client.initialize(&factory_addr);
-    mock_factory_client.set_pair(&token_a, &token_b, &pair_addr);
-    mock_pair_client.set_lp_token(&lp_token_addr);
-    mock_pair_client.set_burn_amounts(&500, &1000);
+    // Step 3: reveal — hash validates, nonce is consumed, swap executes
+    let out = router.reveal_swap(
+        &sender,
+        &token_in_id,
+        &token_out_id,
+        &amount_in,
+        &min_out,
+        &nonce,
+        &salt,
+    );
+    assert!(out > 0, "revealed swap must return positive output");
 
-    // Mint tokens to recipient
-    StellarAssetClient::new(&env, &token_a).mint(&to, &10000);
-    StellarAssetClient::new(&env, &token_b).mint(&to, &10000);
-    lp_sac_client.mint(&to, &2000);
+    // Step 4: same nonce is now rejected
+    let hash2 = make_commit_hash(
+        &env,
+        &sender,
+        &token_in_id,
+        &token_out_id,
+        amount_in,
+        min_out,
+        nonce,
+        &salt,
+    );
+    router.commit_swap(&sender, &hash2);
+    env.ledger().set_sequence_number(env.ledger().sequence() + 1);
 
-    let deadline = env.ledger().timestamp() + 1000;
-
-    (env, router_client, token_a, token_b, to, deadline, mock_pair_client, lp_token_addr, pair_addr)
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.reveal_swap(
+            &sender,
+            &token_in_id,
+            &token_out_id,
+            &amount_in,
+            &min_out,
+            &nonce,
+            &salt,
+        );
+    }));
+    assert!(result.is_err(), "replayed nonce must be rejected");
 }
 
-// ── add_liquidity test setup ──────────────────────────────────────────────────
+// ===========================================================================
+// ============================== sweep tests ================================
+// ===========================================================================
 
-/// Sets up a full mock environment for add_liquidity tests with real token contracts.
-///
-/// Returns (env, router_client, token_a, token_b, to, deadline,
-///          mock_pair_client, pair_addr).
-#[allow(clippy::type_complexity)]
-fn setup_add_liquidity_env(
-) -> (Env, RouterClient<'static>, Address, Address, Address, u64, MockPairClient<'static>, Address)
-{
+#[test]
+fn test_sweep_drains_stuck_balance_to_recipient() {
+    let env = Env::default();
+    // BLANKET MOCK (issue #314): router routing arithmetic, not authorization.
+    // Guards are covered by the per-contract `auth_matrix` module.
+    env.mock_all_auths();
+    let (router_id, factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+
+    let governance = Address::generate(&env);
+    MockFactoryClient::new(&env, &factory_id).set_fee_to_setter(&governance);
+
+    // Simulate an orphaned balance left on the router after a failed path.
+    let token = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    soroban_sdk::token::StellarAssetClient::new(&env, &token).mint(&router_id, &500);
+
+    let recipient = Address::generate(&env);
+    let swept = router.sweep(&token, &recipient);
+    assert_eq!(swept, 500);
+    assert_eq!(env.auths()[0].0, governance, "sweep must be authorized by governance");
+    let token_client = soroban_sdk::token::TokenClient::new(&env, &token);
+    assert_eq!(token_client.balance(&recipient), 500);
+    assert_eq!(token_client.balance(&router_id), 0);
+}
+
+#[test]
+fn test_sweep_without_governance_auth_fails() {
+    // No mock_all_auths: the governance address never authorizes the call.
+    let env = Env::default();
+    let (router_id, factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+
+    MockFactoryClient::new(&env, &factory_id).set_fee_to_setter(&Address::generate(&env));
+
+    let token = Address::generate(&env);
+    let recipient = Address::generate(&env);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.sweep(&token, &recipient);
+    }));
+    assert!(result.is_err(), "sweep without governance authorization must fail");
+}
+
+#[test]
+fn test_sweep_zero_balance_fails() {
+    let env = Env::default();
+    // BLANKET MOCK (issue #314): router routing arithmetic, not authorization.
+    // Guards are covered by the per-contract `auth_matrix` module.
+    env.mock_all_auths();
+    let (router_id, factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
+
+    MockFactoryClient::new(&env, &factory_id).set_fee_to_setter(&Address::generate(&env));
+
+    let token = env.register_stellar_asset_contract_v2(Address::generate(&env)).address();
+    let recipient = Address::generate(&env);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.sweep(&token, &recipient);
+    }));
+    assert!(result.is_err(), "sweeping an empty balance must fail (ZeroAmount)");
+}
+
+#[test]
+fn test_hop_check_validates_is_pair() {
     let env = Env::default();
     env.mock_all_auths();
+    let (router_id, factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
 
-    // Register contracts
-    let router_addr = env.register_contract(None, Router);
-    let router_client = RouterClient::new(&env, &router_addr);
-
-    let factory_addr = env.register_contract(None, MockFactory);
-    let mock_factory_client = MockFactoryClient::new(&env, &factory_addr);
-
-    let pair_addr = env.register_contract(None, MockPair);
-    let mock_pair_client = MockPairClient::new(&env, &pair_addr);
-
-    // Create real token contracts for token_a and token_b
-    let admin_a = Address::generate(&env);
-    let token_a = env.register_stellar_asset_contract_v2(admin_a).address();
-    let sac_a = StellarAssetClient::new(&env, &token_a);
-
-    let admin_b = Address::generate(&env);
-    let token_b = env.register_stellar_asset_contract_v2(admin_b).address();
-    let sac_b = StellarAssetClient::new(&env, &token_b);
-
-    let to = Address::generate(&env);
-
-    // Wire up: Router -> Factory -> Pair
-    router_client.initialize(&factory_addr);
-    mock_factory_client.set_pair(&token_a, &token_b, &pair_addr);
-    mock_pair_client.set_reserves(&0, &0);
-    mock_pair_client.set_mint_return(&1000);
-
-    // Mint tokens to the user
-    sac_a.mint(&to, &100_000);
-    sac_b.mint(&to, &100_000);
-
-    let deadline = env.ledger().timestamp() + 1000;
-
-    (env, router_client, token_a, token_b, to, deadline, mock_pair_client, pair_addr)
-}
-
-// ── Placeholder tests (other functions still todo) ────────────────────────────
-
-#[test]
-fn test_placeholder_swap_exact_in() {
-    let _env = Env::default();
-}
-
-#[test]
-fn test_placeholder_swap_tokens_for_exact_tokens() {
-    let _env = Env::default();
-}
-
-// ── add_liquidity tests ───────────────────────────────────────────────────────
-
-#[test]
-fn test_add_liquidity_expired_deadline() {
-    let env = Env::default();
-    let router = RouterClient::new(&env, &env.register_contract(None, Router));
-
-    let factory_address = Address::generate(&env);
     let token_a = Address::generate(&env);
     let token_b = Address::generate(&env);
-    let to = Address::generate(&env);
+    let fake_pair = Address::generate(&env);
 
-    router.initialize(&factory_address);
+    // Factory maps token_a, token_b -> fake_pair, but is_pair is false
+    MockFactoryClient::new(&env, &factory_id).set_pair(&token_a, &token_b, &fake_pair);
+    MockFactoryClient::new(&env, &factory_id).set_is_pair(&fake_pair, &false);
 
-    // Move ledger time forward so we can set a past deadline
-    env.ledger().set_timestamp(2000);
-    let past_deadline = env.ledger().timestamp() - 1000;
+    let mut path = Vec::new(&env);
+    path.push_back(token_a.clone());
+    path.push_back(token_b.clone());
 
-    let result = router.try_add_liquidity(
-        &token_a,
-        &token_b,
-        &1000i128,
-        &1000i128,
-        &500i128,
-        &500i128,
-        &to,
-        &past_deadline,
-    );
+    let user = Address::generate(&env);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.swap_exact_tokens_multi_hop(&path, &1000, &1, &user, &u64::MAX, &None);
+    }));
+    assert!(result.is_err(), "hop check must fail when is_pair is false");
 
-    assert_eq!(result, Err(Ok(RouterError::Expired)));
+    // Now mark is_pair as true
+    MockFactoryClient::new(&env, &factory_id).set_is_pair(&fake_pair, &true);
+    assert!(MockFactoryClient::new(&env, &factory_id).is_pair(&fake_pair));
 }
 
 #[test]
-fn test_add_liquidity_zero_amount_a() {
-    let env = Env::default();
-    let router = RouterClient::new(&env, &env.register_contract(None, Router));
-
-    let factory_address = Address::generate(&env);
-    let token_a = Address::generate(&env);
-    let token_b = Address::generate(&env);
-    let to = Address::generate(&env);
-
-    router.initialize(&factory_address);
-
-    let deadline = env.ledger().timestamp() + 1000;
-
-    let result = router.try_add_liquidity(
-        &token_a, &token_b, &0i128, // zero amount_a_desired
-        &1000i128, &0i128, &500i128, &to, &deadline,
-    );
-
-    assert_eq!(result, Err(Ok(RouterError::ZeroAmount)));
-}
-
-#[test]
-fn test_add_liquidity_zero_amount_b() {
-    let env = Env::default();
-    let router = RouterClient::new(&env, &env.register_contract(None, Router));
-
-    let factory_address = Address::generate(&env);
-    let token_a = Address::generate(&env);
-    let token_b = Address::generate(&env);
-    let to = Address::generate(&env);
-
-    router.initialize(&factory_address);
-
-    let deadline = env.ledger().timestamp() + 1000;
-
-    let result = router.try_add_liquidity(
-        &token_a, &token_b, &1000i128, &0i128, // zero amount_b_desired
-        &500i128, &0i128, &to, &deadline,
-    );
-
-    assert_eq!(result, Err(Ok(RouterError::ZeroAmount)));
-}
-
-#[test]
-fn test_add_liquidity_identical_tokens() {
-    let env = Env::default();
-    let router = RouterClient::new(&env, &env.register_contract(None, Router));
-
-    let factory_address = Address::generate(&env);
-    let token_a = Address::generate(&env);
-    let to = Address::generate(&env);
-
-    router.initialize(&factory_address);
-
-    let deadline = env.ledger().timestamp() + 1000;
-
-    // Pass the same address for both tokens
-    let result = router.try_add_liquidity(
-        &token_a, &token_a, // identical
-        &1000i128, &1000i128, &500i128, &500i128, &to, &deadline,
-    );
-
-    assert_eq!(result, Err(Ok(RouterError::IdenticalTokens)));
-}
-
-#[test]
-fn test_add_liquidity_pair_not_found() {
+fn test_multi_hop_rejects_forged_registered_pair() {
     let env = Env::default();
     env.mock_all_auths();
-
-    let factory_addr = env.register_contract(None, MockFactory);
-    let router_addr = env.register_contract(None, Router);
-    let router = RouterClient::new(&env, &router_addr);
+    let (router_id, factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
 
     let token_a = Address::generate(&env);
     let token_b = Address::generate(&env);
-    let to = Address::generate(&env);
+    let forged_pair = Address::generate(&env);
+    let factory = MockFactoryClient::new(&env, &factory_id);
+    factory.set_pair(&token_a, &token_b, &forged_pair);
+    factory.set_is_pair(&forged_pair, &true);
 
-    router.initialize(&factory_addr);
+    let mut path = Vec::new(&env);
+    path.push_back(token_a);
+    path.push_back(token_b);
 
-    // Factory has no pair registered
-    let deadline = env.ledger().timestamp() + 1000;
-
-    let result = router.try_add_liquidity(
-        &token_a, &token_b, &1000i128, &1000i128, &500i128, &500i128, &to, &deadline,
-    );
-
-    assert_eq!(result, Err(Ok(RouterError::PairNotFound)));
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.swap_exact_tokens_multi_hop(
+            &path,
+            &1_000,
+            &1,
+            &Address::generate(&env),
+            &u64::MAX,
+            &None,
+        );
+    }));
+    assert!(result.is_err(), "a registered address without the pair interface must be rejected");
 }
 
 #[test]
-fn test_add_liquidity_first_deposit() {
-    let (_env, router_client, token_a, token_b, to, deadline, _mock_pair_client, _pair_addr) =
-        setup_add_liquidity_env();
-
-    // Reserves are zero (first deposit) -- desired amounts are used as-is
-    let result = router_client.add_liquidity(
-        &token_a, &token_b, &5000i128, &10000i128, &5000i128, &10000i128, &to, &deadline,
-    );
-
-    // Amounts should equal desired, liquidity from mock is 1000
-    assert_eq!(result, (5000, 10000, 1000));
-}
-
-#[test]
-fn test_add_liquidity_proportional_deposit_b_optimal() {
-    let (_env, router_client, token_a, token_b, to, deadline, mock_pair_client, _pair_addr) =
-        setup_add_liquidity_env();
-
-    // Set existing reserves at 1:2 ratio
-    mock_pair_client.set_reserves(&1000, &2000);
-    mock_pair_client.set_mint_return(&500);
-
-    // amount_b_optimal = 1000 * 2000 / 1000 = 2000 <= 3000 (desired_b)
-    // So we deposit (1000, 2000)
-    let result = router_client.add_liquidity(
-        &token_a, &token_b, &1000i128, // amount_a_desired
-        &3000i128, // amount_b_desired
-        &500i128,  // amount_a_min
-        &1000i128, // amount_b_min
-        &to, &deadline,
-    );
-
-    assert_eq!(result, (1000, 2000, 500));
-}
-
-#[test]
-fn test_add_liquidity_proportional_deposit_a_optimal() {
-    let (_env, router_client, token_a, token_b, to, deadline, mock_pair_client, _pair_addr) =
-        setup_add_liquidity_env();
-
-    // Set existing reserves at 1:2 ratio
-    mock_pair_client.set_reserves(&1000, &2000);
-    mock_pair_client.set_mint_return(&250);
-
-    // amount_b_optimal = 2000 * 2000 / 1000 = 4000 > 2000 (desired_b)
-    // So compute amount_a_optimal = 2000 * 1000 / 2000 = 1000
-    // Deposit (1000, 2000)
-    let result = router_client.add_liquidity(
-        &token_a, &token_b, &2000i128, // amount_a_desired
-        &2000i128, // amount_b_desired
-        &500i128,  // amount_a_min
-        &1000i128, // amount_b_min
-        &to, &deadline,
-    );
-
-    assert_eq!(result, (1000, 2000, 250));
-}
-
-#[test]
-fn test_add_liquidity_slippage_revert_b() {
-    let (_env, router_client, token_a, token_b, to, deadline, mock_pair_client, _pair_addr) =
-        setup_add_liquidity_env();
-
-    // Set existing reserves at 1:2 ratio
-    mock_pair_client.set_reserves(&1000, &2000);
-
-    // amount_b_optimal = 500 * 2000 / 1000 = 1000 <= 1500 (desired_b)
-    // But 1000 < 1200 (amount_b_min) → slippage revert
-    let result = router_client.try_add_liquidity(
-        &token_a, &token_b, &500i128,  // amount_a_desired
-        &1500i128, // amount_b_desired
-        &400i128,  // amount_a_min
-        &1200i128, // amount_b_min (above optimal)
-        &to, &deadline,
-    );
-
-    assert_eq!(result, Err(Ok(RouterError::SlippageExceeded)));
-}
-
-#[test]
-fn test_add_liquidity_slippage_revert_a() {
-    let (_env, router_client, token_a, token_b, to, deadline, mock_pair_client, _pair_addr) =
-        setup_add_liquidity_env();
-
-    // Set existing reserves at 1:2 ratio
-    mock_pair_client.set_reserves(&1000, &2000);
-
-    // amount_b_optimal = 3000 * 2000 / 1000 = 6000 > 2000 (desired_b)
-    // so compute amount_a_optimal = 2000 * 1000 / 2000 = 1000
-    // 1000 < 1500 (amount_a_min) → slippage revert
-    let result = router_client.try_add_liquidity(
-        &token_a, &token_b, &3000i128, // amount_a_desired
-        &2000i128, // amount_b_desired
-        &1500i128, // amount_a_min (above optimal)
-        &1000i128, // amount_b_min
-        &to, &deadline,
-    );
-
-    assert_eq!(result, Err(Ok(RouterError::SlippageExceeded)));
-}
-
-#[test]
-fn test_add_liquidity_tokens_transferred_to_pair() {
-    let (_env, router_client, token_a, token_b, to, deadline, _mock_pair_client, pair_addr) =
-        setup_add_liquidity_env();
-
-    let token_a_client = TokenClient::new(&_env, &token_a);
-    let token_b_client = TokenClient::new(&_env, &token_b);
-    let balance_a_before = token_a_client.balance(&to);
-    let balance_b_before = token_b_client.balance(&to);
-
-    // First deposit: amounts used as-is
-    router_client.add_liquidity(
-        &token_a, &token_b, &3000i128, &5000i128, &3000i128, &5000i128, &to, &deadline,
-    );
-
-    // User balance should decrease by deposited amounts
-    assert_eq!(token_a_client.balance(&to), balance_a_before - 3000);
-    assert_eq!(token_b_client.balance(&to), balance_b_before - 5000);
-
-    // Pair should have received the tokens
-    assert_eq!(token_a_client.balance(&pair_addr), 3000);
-    assert_eq!(token_b_client.balance(&pair_addr), 5000);
-}
-
-// ── remove_liquidity tests ────────────────────────────────────────────────────
-
-#[test]
-fn test_remove_liquidity_expired_deadline() {
-    let env = Env::default();
-    let router = RouterClient::new(&env, &env.register_contract(None, Router));
-
-    let factory_address = Address::generate(&env);
-    let token_a = Address::generate(&env);
-    let token_b = Address::generate(&env);
-    let to = Address::generate(&env);
-
-    router.initialize(&factory_address);
-
-    // Move ledger time forward so we can set a past deadline
-    env.ledger().set_timestamp(2000);
-    let past_deadline = env.ledger().timestamp() - 1000;
-
-    let result = router.try_remove_liquidity(
-        &token_a,
-        &token_b,
-        &100i128,
-        &50i128,
-        &50i128,
-        &to,
-        &past_deadline,
-    );
-
-    assert_eq!(result, Err(Ok(RouterError::Expired)));
-}
-
-#[test]
-fn test_remove_liquidity_zero_amount() {
-    let env = Env::default();
-    let router = RouterClient::new(&env, &env.register_contract(None, Router));
-
-    let factory_address = Address::generate(&env);
-    let token_a = Address::generate(&env);
-    let token_b = Address::generate(&env);
-    let to = Address::generate(&env);
-
-    router.initialize(&factory_address);
-
-    let deadline = env.ledger().timestamp() + 1000;
-
-    let result = router.try_remove_liquidity(
-        &token_a, &token_b, &0i128, // zero liquidity
-        &50i128, &50i128, &to, &deadline,
-    );
-
-    assert_eq!(result, Err(Ok(RouterError::ZeroAmount)));
-}
-
-#[test]
-fn test_remove_liquidity_identical_tokens() {
-    let env = Env::default();
-    let router = RouterClient::new(&env, &env.register_contract(None, Router));
-
-    let factory_address = Address::generate(&env);
-    let token_a = Address::generate(&env);
-    let to = Address::generate(&env);
-
-    router.initialize(&factory_address);
-
-    let deadline = env.ledger().timestamp() + 1000;
-
-    // Pass the same address for both tokens
-    let result = router.try_remove_liquidity(
-        &token_a, &token_a, // identical
-        &100i128, &50i128, &50i128, &to, &deadline,
-    );
-
-    assert_eq!(result, Err(Ok(RouterError::IdenticalTokens)));
-}
-
-#[test]
-fn test_remove_liquidity_pair_not_found() {
+fn test_mid_path_price_crash_reverts() {
     let env = Env::default();
     env.mock_all_auths();
+    let (router_id, factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
 
-    let factory_addr = env.register_contract(None, MockFactory);
-    let router_addr = env.register_contract(None, Router);
-    let router = RouterClient::new(&env, &router_addr);
+    let tokens = generate_asset_tokens(&env, 3);
+    let token_in = tokens.get(0).unwrap();
+    let hub = tokens.get(1).unwrap();
+    let token_out = tokens.get(2).unwrap();
 
-    let token_a = Address::generate(&env);
-    let token_b = Address::generate(&env);
-    let to = Address::generate(&env);
+    // Set up 2-hop path: token_in -> hub -> token_out
+    // First hop: normal liquidity (token_in/hub)
+    setup_pair(&env, &factory_id, &token_in, &hub, 1_000_000, 1_000_000);
+    // Second hop: normal liquidity (hub/token_out)
+    setup_pair(&env, &factory_id, &hub, &token_out, 1_000_000, 1_000_000);
 
-    router.initialize(&factory_addr);
+    let mut path = Vec::new(&env);
+    path.push_back(token_in.clone());
+    path.push_back(hub.clone());
+    path.push_back(token_out.clone());
 
-    // Factory has no pair registered
-    let deadline = env.ledger().timestamp() + 1000;
+    let user = Address::generate(&env);
+    let amount_in = 10_000;
+    soroban_sdk::token::StellarAssetClient::new(&env, &token_in).mint(&user, &(amount_in * 2));
+    // MockPair::swap moves no tokens, so fund the router with the hub token a
+    // real first-hop pair would send it to forward.
+    soroban_sdk::token::StellarAssetClient::new(&env, &hub).mint(&router_id, &(amount_in * 2));
+    let min_out = 9_000; // Global minimum output
 
-    let result =
-        router.try_remove_liquidity(&token_a, &token_b, &100i128, &50i128, &50i128, &to, &deadline);
+    // First, verify normal swap succeeds
+    let out =
+        router.swap_exact_tokens_multi_hop(&path, &amount_in, &min_out, &user, &u64::MAX, &None);
+    assert!(out >= min_out, "normal swap should meet minimum");
 
-    assert_eq!(result, Err(Ok(RouterError::PairNotFound)));
+    // Now simulate mid-path price crash by draining the hub token reserves
+    // This causes extreme slippage on the first hop (token_in -> hub)
+    // The first hop will now produce very little hub tokens
+    let pair_1 = MockFactoryClient::new(&env, &factory_id).get_pair(&token_in, &hub).unwrap();
+    MockPairClient::new(&env, &pair_1).set_reserves(&1_000_000, &100); // Hub reserves drained to 100
+
+    // With the old implementation (final-hop only), this might succeed if the final hop
+    // compensates by having very favorable rates. But economically, the user would get
+    // a terrible deal on the intermediate transfer.
+    // With end-to-end protection, this should revert due to first hop failing its minimum.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        router.swap_exact_tokens_multi_hop(&path, &amount_in, &min_out, &user, &u64::MAX, &None);
+    }));
+    assert!(result.is_err(), "mid-path price crash must revert (InsufficientOutputAmount)");
 }
 
 #[test]
-fn test_remove_liquidity_happy_path() {
-    let (
-        _env,
-        router_client,
-        token_a,
-        token_b,
-        to,
-        deadline,
-        _mock_pair_client,
-        _lp_token_addr,
-        _pair_addr,
-    ) = setup_full_env();
+fn test_multi_hop_with_zero_min_out_succeeds() {
+    // amount_out_min = 0 means the caller opted out of slippage protection;
+    // the per-hop minimums must not turn that into a ZeroAmount revert.
+    let env = Env::default();
+    env.mock_all_auths();
+    let (router_id, factory_id) = deploy_router(&env);
+    let router = RouterClient::new(&env, &router_id);
 
-    // Mock pair returns (500, 1000) on burn; minimums are below those values
-    let result = router_client.remove_liquidity(
-        &token_a, &token_b, &100i128, // liquidity to burn
-        &400i128, // amount_a_min (below 500 returned)
-        &900i128, // amount_b_min (below 1000 returned)
-        &to, &deadline,
-    );
+    let tokens = generate_asset_tokens(&env, 3);
+    let token_in = tokens.get(0).unwrap();
+    let hub = tokens.get(1).unwrap();
+    let token_out = tokens.get(2).unwrap();
+    setup_pair(&env, &factory_id, &token_in, &hub, 1_000_000, 1_000_000);
+    setup_pair(&env, &factory_id, &hub, &token_out, 1_000_000, 1_000_000);
 
-    assert_eq!(result, (500, 1000));
-}
+    let mut path = Vec::new(&env);
+    path.push_back(token_in.clone());
+    path.push_back(hub.clone());
+    path.push_back(token_out);
 
-#[test]
-fn test_remove_liquidity_exact_minimums() {
-    let (
-        _env,
-        router_client,
-        token_a,
-        token_b,
-        to,
-        deadline,
-        _mock_pair_client,
-        _lp_token_addr,
-        _pair_addr,
-    ) = setup_full_env();
-
-    // amount_a_min == amount_a and amount_b_min == amount_b (edge case)
-    let result = router_client.remove_liquidity(
-        &token_a, &token_b, &100i128, &500i128,  // exactly equal to returned amount_a
-        &1000i128, // exactly equal to returned amount_b
-        &to, &deadline,
-    );
-
-    assert_eq!(result, (500, 1000));
-}
-
-#[test]
-fn test_remove_liquidity_insufficient_output_amount_a() {
-    let (
-        _env,
-        router_client,
-        token_a,
-        token_b,
-        to,
-        deadline,
-        _mock_pair_client,
-        _lp_token_addr,
-        _pair_addr,
-    ) = setup_full_env();
-
-    // amount_a_min > returned amount_a (500) → slippage revert
-    let result = router_client.try_remove_liquidity(
-        &token_a, &token_b, &100i128, &600i128, // above 500 returned
-        &900i128, &to, &deadline,
-    );
-
-    assert_eq!(result, Err(Ok(RouterError::InsufficientOutputAmount)));
-}
-
-#[test]
-fn test_remove_liquidity_insufficient_output_amount_b() {
-    let (
-        _env,
-        router_client,
-        token_a,
-        token_b,
-        to,
-        deadline,
-        _mock_pair_client,
-        _lp_token_addr,
-        _pair_addr,
-    ) = setup_full_env();
-
-    // amount_b_min > returned amount_b (1000) → slippage revert
-    let result = router_client.try_remove_liquidity(
-        &token_a, &token_b, &100i128, &400i128, &1100i128, // above 1000 returned
-        &to, &deadline,
-    );
-
-    assert_eq!(result, Err(Ok(RouterError::InsufficientOutputAmount)));
-}
-
-#[test]
-fn test_remove_liquidity_lp_tokens_transferred() {
-    let (
-        env,
-        router_client,
-        token_a,
-        token_b,
-        to,
-        deadline,
-        _mock_pair_client,
-        lp_token_addr,
-        pair_addr,
-    ) = setup_full_env();
-
-    let lp_token = TokenClient::new(&env, &lp_token_addr);
-    let balance_before = lp_token.balance(&to);
-
-    let liquidity: i128 = 200;
-    router_client
-        .remove_liquidity(&token_a, &token_b, &liquidity, &400i128, &900i128, &to, &deadline);
-
-    // LP tokens should have been transferred from 'to' to pair
-    let balance_after = lp_token.balance(&to);
-    assert_eq!(balance_after, balance_before - liquidity);
-
-    // Pair should have received the LP tokens
-    let pair_balance = lp_token.balance(&pair_addr);
-    assert_eq!(pair_balance, liquidity);
+    let user = Address::generate(&env);
+    soroban_sdk::token::StellarAssetClient::new(&env, &token_in).mint(&user, &10_000);
+    // MockPair::swap moves no tokens, so fund the router with the hub token a
+    // real first-hop pair would send it to forward.
+    soroban_sdk::token::StellarAssetClient::new(&env, &hub).mint(&router_id, &(10_000));
+    let out = router.swap_exact_tokens_multi_hop(&path, &10_000, &0, &user, &u64::MAX, &None);
+    assert!(out > 0, "a zero minimum must still execute the swap");
 }

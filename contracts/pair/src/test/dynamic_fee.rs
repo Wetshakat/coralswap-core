@@ -1,5 +1,6 @@
-use crate::dynamic_fee::{compute_fee_bps, decay_stale_ema, update_volatility};
-use crate::errors::PairError;
+use crate::dynamic_fee::{
+    compute_fee_bps, decay_stale_ema, update_volatility, DEFAULT_STALE_LEDGER_THRESHOLD,
+};
 use crate::storage::FeeState;
 use soroban_sdk::{testutils::Ledger, Env};
 
@@ -17,6 +18,7 @@ fn default_fee_state() -> FeeState {
         cooldown_divisor: 2,
         last_fee_update: 0,
         decay_threshold_blocks: 100,
+        stale_threshold: DEFAULT_STALE_LEDGER_THRESHOLD,
     }
 }
 
@@ -29,9 +31,9 @@ fn test_update_volatility_zero_reserve_returns_error() {
     let env = Env::default();
     let mut fee_state = default_fee_state();
 
-    update_volatility(&env, &mut fee_state, 1000, 100, 0);
+    assert!(update_volatility(&env, &mut fee_state, 1000, 100, 0).is_err());
 
-    // Should not panic and accumulator should remain unchanged
+    // Accumulator should remain unchanged after the rejected update
     assert_eq!(fee_state.vol_accumulator, 0);
 }
 
@@ -44,7 +46,7 @@ fn test_update_volatility_increases_accumulator() {
     let trade_size = 1_000_000;
     let total_reserve = 10_000_000;
 
-    update_volatility(&env, &mut fee_state, price_delta, trade_size, total_reserve);
+    update_volatility(&env, &mut fee_state, price_delta, trade_size, total_reserve).unwrap();
 
     // Accumulator should increase from 0
     assert!(fee_state.vol_accumulator > 0);
@@ -60,10 +62,10 @@ fn test_update_volatility_small_trade_has_less_impact() {
     let total_reserve = 10_000_000;
 
     // Small trade: 1% of reserves
-    update_volatility(&env, &mut fee_state_small, price_delta, 100_000, total_reserve);
+    update_volatility(&env, &mut fee_state_small, price_delta, 100_000, total_reserve).unwrap();
 
     // Large trade: 10% of reserves
-    update_volatility(&env, &mut fee_state_large, price_delta, 1_000_000, total_reserve);
+    update_volatility(&env, &mut fee_state_large, price_delta, 1_000_000, total_reserve).unwrap();
 
     // Large trade should have more impact
     assert!(fee_state_large.vol_accumulator > fee_state_small.vol_accumulator);
@@ -100,7 +102,7 @@ fn test_update_volatility_prevents_manipulation_by_tiny_trades() {
     let tiny_trade = 1; // Extremely small trade
     let total_reserve = 10_000_000;
 
-    update_volatility(&env, &mut fee_state, price_delta, tiny_trade, total_reserve);
+    update_volatility(&env, &mut fee_state, price_delta, tiny_trade, total_reserve).unwrap();
 
     // Impact should be minimal due to size weighting
     assert!(fee_state.vol_accumulator < price_delta / 1000);
@@ -186,6 +188,7 @@ fn test_decay_no_decay_before_threshold() {
     fee_state.decay_threshold_blocks = 1000; // Threshold not reached
 
     let initial_vol = fee_state.vol_accumulator;
+    let initial_update = fee_state.last_fee_update;
 
     decay_stale_ema(&env, &mut fee_state);
 
@@ -355,9 +358,6 @@ fn test_decay_caps_at_max_periods() {
     assert!(fee_state.vol_accumulator < i128::MAX / 1_000_000);
 }
 
-    assert_eq!(fee_state.vol_accumulator, 0);
-}
-
 #[test]
 fn test_large_trade_increases_fee() {
     let env = Env::default();
@@ -370,7 +370,7 @@ fn test_large_trade_increases_fee() {
     let trade_size = 2_000_000;
     let total_reserve = 10_000_000;
 
-    update_volatility(&env, &mut fee_state, price_delta, trade_size, total_reserve);
+    update_volatility(&env, &mut fee_state, price_delta, trade_size, total_reserve).unwrap();
 
     let new_fee = compute_fee_bps(&fee_state);
 
@@ -405,7 +405,8 @@ fn test_fee_stays_within_bounds_under_extreme_conditions() {
 
     // Extreme volatility updates
     for _ in 0..100 {
-        update_volatility(&env, &mut fee_state, 100_000_000_000_000, 10_000_000, 10_000_000);
+        update_volatility(&env, &mut fee_state, 100_000_000_000_000, 10_000_000, 10_000_000)
+            .unwrap();
     }
 
     let fee = compute_fee_bps(&fee_state);
@@ -500,10 +501,10 @@ fn test_compute_fee_bps_moderate_vol_between_baseline_and_max() {
     let mut fee_state = default_fee_state();
     // Choose a vol_accumulator that produces a fee between baseline (30) and max (100)
     // vol_bps = (vol * ramp_up_multiplier) / (SCALE / 10_000)
-    //         = (vol * 1000) / 10_000_000_000
+    //         = (vol * 2) / 10_000_000_000
     // We want fee = 30 + vol_bps = 60, so vol_bps = 30
-    // 30 = (vol * 1000) / 10_000_000_000 → vol = 300_000_000
-    fee_state.vol_accumulator = 300_000_000; // 3e8
+    // 30 = (vol * 2) / 10_000_000_000 → vol = 150_000_000_000
+    fee_state.vol_accumulator = 150_000_000_000; // 1.5e11
 
     let fee = compute_fee_bps(&fee_state);
 
@@ -522,4 +523,445 @@ fn test_compute_fee_bps_tiny_vol_returns_near_baseline() {
 
     // vol_bps = (1 * 1000) / 1e10 = 0 → fee = 30 + 0 = 30
     assert_eq!(fee, fee_state.baseline_fee_bps);
+}
+
+// ============================================================================
+// Integration Test: Volatility Tracking in Swap
+// ============================================================================
+
+// Helper: Mock Token for testing
+mod mock_token_for_volatility_test {
+    use soroban_sdk::{contract, contractimpl, contracttype, Address, Env};
+
+    #[contracttype]
+    pub enum MockTokenKey {
+        Balance(Address),
+    }
+
+    #[contract]
+    pub struct MockToken;
+
+    #[contractimpl]
+    impl MockToken {
+        pub fn mint(env: Env, to: Address, amount: i128) {
+            let key = MockTokenKey::Balance(to);
+            let bal: i128 = env.storage().persistent().get(&key).unwrap_or(0);
+            env.storage().persistent().set(&key, &(bal + amount));
+        }
+
+        pub fn transfer(env: Env, from: Address, to: Address, amount: i128) {
+            from.require_auth();
+            let fk = MockTokenKey::Balance(from);
+            let tk = MockTokenKey::Balance(to);
+            let fb: i128 = env.storage().persistent().get(&fk).unwrap_or(0);
+            let tb: i128 = env.storage().persistent().get(&tk).unwrap_or(0);
+            env.storage().persistent().set(&fk, &(fb - amount));
+            env.storage().persistent().set(&tk, &(tb + amount));
+        }
+
+        pub fn balance(env: Env, id: Address) -> i128 {
+            env.storage().persistent().get(&MockTokenKey::Balance(id)).unwrap_or(0)
+        }
+    }
+}
+
+#[test]
+fn test_swap_updates_volatility_accumulator() {
+    use crate::{Pair, PairClient};
+    use coralswap_lp_token::{LpToken, LpTokenClient};
+    use mock_token_for_volatility_test::{MockToken, MockTokenClient};
+    use soroban_sdk::{testutils::Address as _, Address, Env, String};
+
+    let env = Env::default();
+    // BLANKET MOCK (issue #314): dynamic fee arithmetic, not authorization.
+    // Guards are covered by the per-contract `auth_matrix` module.
+    env.mock_all_auths_allowing_non_root_auth();
+
+    // Deploy contracts
+    let token_a_id = env.register(MockToken, ());
+    let token_b_id = env.register(MockToken, ());
+    let lp_id = env.register(LpToken, ());
+    let pair_id = env.register(Pair, ());
+
+    let token_a = MockTokenClient::new(&env, &token_a_id);
+    let token_b = MockTokenClient::new(&env, &token_b_id);
+    let lp_client = LpTokenClient::new(&env, &lp_id);
+    let pair_client = PairClient::new(&env, &pair_id);
+
+    let admin = Address::generate(&env);
+    let factory = Address::generate(&env);
+
+    lp_client.initialize(
+        &admin,
+        &7u32,
+        &String::from_str(&env, "Coral LP"),
+        &String::from_str(&env, "CLP"),
+    );
+
+    pair_client.initialize(&factory, &token_a_id, &token_b_id, &lp_id);
+
+    // Mint tokens to user
+    let user = Address::generate(&env);
+    token_a.mint(&user, &10_000_000);
+    token_b.mint(&user, &10_000_000);
+
+    // Add initial liquidity
+    token_a.transfer(&user, &pair_id, &1_000_000);
+    token_b.transfer(&user, &pair_id, &1_000_000);
+    pair_client.mint(&user);
+
+    // Get initial fee (should be baseline)
+    let initial_fee = pair_client.get_current_fee_bps();
+    assert_eq!(initial_fee, 30, "Initial fee should be baseline");
+
+    // Perform a large swap to create volatility
+    let swap_amount = 100_000i128;
+    token_a.transfer(&user, &pair_id, &swap_amount);
+
+    // Request a reasonable output amount (less than what's available)
+    let (_reserve_a, reserve_b, _) = pair_client.get_reserves();
+    let amount_out = reserve_b / 20; // Request 5% of reserve_b
+
+    pair_client.swap(&0, &amount_out, &user);
+
+    // Get fee after first swap - volatility should have increased
+    let fee_after_swap1 = pair_client.get_current_fee_bps();
+
+    // Perform another large swap in opposite direction
+    token_b.transfer(&user, &pair_id, &swap_amount);
+    let (reserve_a2, _reserve_b2, _) = pair_client.get_reserves();
+    let amount_out2 = reserve_a2 / 20; // Request 5% of reserve_a
+    pair_client.swap(&amount_out2, &0, &user);
+
+    // Get fee after second swap
+    let fee_after_swap2 = pair_client.get_current_fee_bps();
+
+    // Verify that fees increased due to volatility
+    assert!(
+        fee_after_swap1 >= initial_fee,
+        "Fee after first swap should be >= initial fee (was {}, now {})",
+        initial_fee,
+        fee_after_swap1
+    );
+
+    assert!(
+        fee_after_swap2 >= fee_after_swap1,
+        "Fee should continue to increase with more volatility (was {}, now {})",
+        fee_after_swap1,
+        fee_after_swap2
+    );
+
+    // Verify fee stays within bounds
+    assert!(fee_after_swap2 <= 100, "Fee should not exceed max_fee_bps");
+    assert!(fee_after_swap2 >= 10, "Fee should not go below min_fee_bps");
+}
+
+#[test]
+fn test_multiple_swaps_accumulate_volatility() {
+    use crate::{Pair, PairClient};
+    use coralswap_lp_token::{LpToken, LpTokenClient};
+    use mock_token_for_volatility_test::{MockToken, MockTokenClient};
+    use soroban_sdk::{testutils::Address as _, Address, Env, String};
+
+    let env = Env::default();
+    // BLANKET MOCK (issue #314): dynamic fee arithmetic, not authorization.
+    // Guards are covered by the per-contract `auth_matrix` module.
+    env.mock_all_auths_allowing_non_root_auth();
+
+    // Deploy contracts
+    let token_a_id = env.register(MockToken, ());
+    let token_b_id = env.register(MockToken, ());
+    let lp_id = env.register(LpToken, ());
+    let pair_id = env.register(Pair, ());
+
+    let token_a = MockTokenClient::new(&env, &token_a_id);
+    let token_b = MockTokenClient::new(&env, &token_b_id);
+    let lp_client = LpTokenClient::new(&env, &lp_id);
+    let pair_client = PairClient::new(&env, &pair_id);
+
+    let admin = Address::generate(&env);
+    let factory = Address::generate(&env);
+
+    lp_client.initialize(
+        &admin,
+        &7u32,
+        &String::from_str(&env, "Coral LP"),
+        &String::from_str(&env, "CLP"),
+    );
+
+    pair_client.initialize(&factory, &token_a_id, &token_b_id, &lp_id);
+
+    // Mint tokens to user
+    let user = Address::generate(&env);
+    token_a.mint(&user, &100_000_000);
+    token_b.mint(&user, &100_000_000);
+
+    // Add initial liquidity
+    token_a.transfer(&user, &pair_id, &10_000_000);
+    token_b.transfer(&user, &pair_id, &10_000_000);
+    pair_client.mint(&user);
+
+    let initial_fee = pair_client.get_current_fee_bps();
+
+    // Perform multiple swaps to accumulate volatility
+    for i in 0..5 {
+        let swap_amount = 500_000i128;
+
+        if i % 2 == 0 {
+            // Swap A for B
+            token_a.transfer(&user, &pair_id, &swap_amount);
+            let (_reserve_a, reserve_b, _) = pair_client.get_reserves();
+            let amount_out = reserve_b / 30; // Request ~3% of reserve
+            pair_client.swap(&0, &amount_out, &user);
+        } else {
+            // Swap B for A
+            token_b.transfer(&user, &pair_id, &swap_amount);
+            let (reserve_a, _reserve_b, _) = pair_client.get_reserves();
+            let amount_out = reserve_a / 30; // Request ~3% of reserve
+            pair_client.swap(&amount_out, &0, &user);
+        }
+    }
+
+    let final_fee = pair_client.get_current_fee_bps();
+
+    // After multiple large swaps, fee should be elevated
+    assert!(
+        final_fee > initial_fee,
+        "Fee should increase after multiple swaps (was {}, now {})",
+        initial_fee,
+        final_fee
+    );
+}
+
+// ============================================================================
+// set_stale_threshold Tests
+// ============================================================================
+
+#[test]
+fn test_default_fee_state_has_correct_stale_threshold() {
+    let fee_state = default_fee_state();
+
+    assert_eq!(fee_state.stale_threshold, DEFAULT_STALE_LEDGER_THRESHOLD);
+    assert_eq!(fee_state.stale_threshold, 100);
+}
+
+#[test]
+fn test_decay_uses_configurable_stale_threshold() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(200);
+
+    let mut fee_state = default_fee_state();
+    fee_state.vol_accumulator = 1_000_000_000_000;
+    fee_state.last_fee_update = 0;
+    fee_state.stale_threshold = 150; // Set to 150
+    fee_state.decay_threshold_blocks = 100; // Should be ignored in favor of stale_threshold
+
+    let initial_vol = fee_state.vol_accumulator;
+
+    decay_stale_ema(&env, &mut fee_state);
+
+    // No decay yet because 200 < 150 + 0 is false but 200 > 150 is true.
+    // Actually: current_ledger (200) > last_fee_update (0) + stale_threshold (150)
+    // 200 > 150? Yes, so decay should happen.
+    assert!(fee_state.vol_accumulator < initial_vol);
+}
+
+#[test]
+fn test_decay_does_not_trigger_before_stale_threshold() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(100);
+
+    let mut fee_state = default_fee_state();
+    fee_state.vol_accumulator = 1_000_000_000_000;
+    fee_state.last_fee_update = 0;
+    fee_state.stale_threshold = 500; // High threshold
+
+    let initial_vol = fee_state.vol_accumulator;
+
+    decay_stale_ema(&env, &mut fee_state);
+
+    // Should not decay: 100 is not > 500
+    assert_eq!(fee_state.vol_accumulator, initial_vol);
+}
+
+#[test]
+fn test_low_stale_threshold_causes_faster_decay() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(200);
+
+    // Pool with low threshold (5 ledgers)
+    let mut fee_state_low = default_fee_state();
+    fee_state_low.vol_accumulator = 1_000_000_000_000;
+    fee_state_low.last_fee_update = 0;
+    fee_state_low.stale_threshold = 5;
+    fee_state_low.cooldown_divisor = 2;
+
+    // Pool with high threshold (1000 ledgers)
+    let mut fee_state_high = default_fee_state();
+    fee_state_high.vol_accumulator = 1_000_000_000_000;
+    fee_state_high.last_fee_update = 0;
+    fee_state_high.stale_threshold = 1000;
+    fee_state_high.cooldown_divisor = 2;
+
+    decay_stale_ema(&env, &mut fee_state_low);
+    decay_stale_ema(&env, &mut fee_state_high);
+
+    // Low threshold pool should have more decay (lower accumulator)
+    assert!(fee_state_low.vol_accumulator < fee_state_high.vol_accumulator);
+    assert_eq!(fee_state_high.vol_accumulator, 1_000_000_000_000); // No decay yet
+}
+
+#[test]
+fn test_high_stale_threshold_prevents_decay() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(500);
+
+    let mut fee_state = default_fee_state();
+    fee_state.vol_accumulator = 1_000_000_000_000;
+    fee_state.last_fee_update = 0;
+    fee_state.stale_threshold = 1000; // Requires 1000+ ledgers
+
+    let initial_vol = fee_state.vol_accumulator;
+
+    decay_stale_ema(&env, &mut fee_state);
+
+    // Should not decay: 500 is not > 1000
+    assert_eq!(fee_state.vol_accumulator, initial_vol);
+}
+
+#[test]
+fn test_two_pools_different_thresholds_decay_independently() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(300);
+
+    // Pool A: threshold = 100
+    let mut pool_a = default_fee_state();
+    pool_a.vol_accumulator = 1_000_000_000_000;
+    pool_a.last_fee_update = 0;
+    pool_a.stale_threshold = 100;
+
+    // Pool B: threshold = 500
+    let mut pool_b = default_fee_state();
+    pool_b.vol_accumulator = 1_000_000_000_000;
+    pool_b.last_fee_update = 0;
+    pool_b.stale_threshold = 500;
+
+    decay_stale_ema(&env, &mut pool_a);
+    decay_stale_ema(&env, &mut pool_b);
+
+    // Pool A should decay (300 > 100 + 0)
+    // Pool B should NOT decay (300 is not > 500 + 0)
+    assert!(pool_a.vol_accumulator < 1_000_000_000_000);
+    assert_eq!(pool_b.vol_accumulator, 1_000_000_000_000);
+}
+
+#[test]
+fn test_stale_threshold_boundary_1() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(2);
+
+    let mut fee_state = default_fee_state();
+    fee_state.vol_accumulator = 1_000_000_000_000;
+    fee_state.last_fee_update = 0;
+    fee_state.stale_threshold = 1; // Minimum valid threshold
+                                   // Isolate the stale_threshold gate from decay_threshold_blocks (a
+                                   // separate field governing how many decay periods elapsed time buys) —
+                                   // without this, decay_periods = elapsed / decay_threshold_blocks = 2/100
+                                   // rounds down to 0, so the gate fires but no decay is visible.
+    fee_state.decay_threshold_blocks = 1;
+
+    let initial_vol = fee_state.vol_accumulator;
+
+    decay_stale_ema(&env, &mut fee_state);
+
+    // Should decay: 2 > 1 + 0
+    assert!(fee_state.vol_accumulator < initial_vol);
+}
+
+#[test]
+fn test_stale_threshold_boundary_100_000() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(100_001);
+
+    let mut fee_state = default_fee_state();
+    fee_state.vol_accumulator = 1_000_000_000_000;
+    fee_state.last_fee_update = 0;
+    fee_state.stale_threshold = 100_000; // Maximum threshold
+
+    let initial_vol = fee_state.vol_accumulator;
+
+    decay_stale_ema(&env, &mut fee_state);
+
+    // Should decay: 100_001 > 100_000 + 0
+    assert!(fee_state.vol_accumulator < initial_vol);
+}
+
+#[test]
+fn test_stale_threshold_just_before_decay() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(150);
+
+    let mut fee_state = default_fee_state();
+    fee_state.vol_accumulator = 1_000_000_000_000;
+    fee_state.last_fee_update = 0;
+    fee_state.stale_threshold = 150; // Same as ledger distance
+
+    let initial_vol = fee_state.vol_accumulator;
+
+    decay_stale_ema(&env, &mut fee_state);
+
+    // Should NOT decay: 150 is not > 150
+    assert_eq!(fee_state.vol_accumulator, initial_vol);
+}
+
+#[test]
+fn test_stale_threshold_just_past_decay() {
+    let env = Env::default();
+    env.ledger().set_sequence_number(151);
+
+    let mut fee_state = default_fee_state();
+    fee_state.vol_accumulator = 1_000_000_000_000;
+    fee_state.last_fee_update = 0;
+    fee_state.stale_threshold = 150;
+
+    let initial_vol = fee_state.vol_accumulator;
+
+    decay_stale_ema(&env, &mut fee_state);
+
+    // Should decay: 151 > 150
+    assert!(fee_state.vol_accumulator < initial_vol);
+}
+
+#[test]
+fn test_stale_threshold_affects_fee_persistence() {
+    let env = Env::default();
+
+    // Pool with LOW stale threshold: fees decay quickly when idle
+    let mut pool_low = default_fee_state();
+    pool_low.vol_accumulator = 500_000_000_000; // Moderate volatility
+    pool_low.stale_threshold = 10; // Decay starts after 10 blocks
+    pool_low.cooldown_divisor = 2;
+
+    // Pool with HIGH stale threshold: fees persist longer when idle
+    let mut pool_high = default_fee_state();
+    pool_high.vol_accumulator = 500_000_000_000;
+    pool_high.stale_threshold = 5000; // Decay starts after 5000 blocks
+    pool_high.cooldown_divisor = 2;
+
+    let fee_low_before = compute_fee_bps(&pool_low);
+    let fee_high_before = compute_fee_bps(&pool_high);
+
+    // Simulate being idle for 100 blocks
+    env.ledger().set_sequence_number(100);
+    decay_stale_ema(&env, &mut pool_low);
+    decay_stale_ema(&env, &mut pool_high);
+
+    let fee_low_after = compute_fee_bps(&pool_low);
+    let fee_high_after = compute_fee_bps(&pool_high);
+
+    // Pool with low threshold should have decayed (lower fee)
+    assert!(fee_low_after < fee_low_before);
+
+    // Pool with high threshold should NOT have decayed (same fee)
+    assert_eq!(fee_high_after, fee_high_before);
 }

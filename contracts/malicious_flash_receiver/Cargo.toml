@@ -1,0 +1,13 @@
+[package]
+name = "coralswap-malicious-flash-receiver"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+soroban-sdk = { workspace = true }
+coralswap-flash-receiver-interface = { path = "../flash_receiver_interface" }
+coralswap-pair = { path = "../pair" }

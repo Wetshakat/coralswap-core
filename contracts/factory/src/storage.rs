@@ -1,19 +1,24 @@
 use soroban_sdk::{contracttype, Address, BytesN, Env, Vec};
 
-const INSTANCE_LIFETIME_THRESHOLD: u32 = 17280; // ~1 day in 5s ledgers
-const INSTANCE_BUMP_AMOUNT: u32 = 518400; // ~30 days in 5s ledgers
+// Shared factory TTL policy (issue #390). See coralswap-shared for cadence math.
+use coralswap_shared::{
+    FACTORY_INSTANCE_BUMP_AMOUNT as INSTANCE_BUMP_AMOUNT,
+    FACTORY_INSTANCE_THRESHOLD as INSTANCE_LIFETIME_THRESHOLD,
+};
 
 #[contracttype]
 #[derive(Clone, Debug)]
 pub struct FactoryStorage {
     pub signers: Vec<Address>,
     pub pair_wasm_hash: BytesN<32>,
+    pub concentrated_pair_wasm_hash: BytesN<32>,
     pub lp_token_wasm_hash: BytesN<32>,
     pub pair_count: u32,
     pub protocol_version: u32,
     pub paused: bool,
     pub fee_to: Option<Address>,
     pub fee_to_setter: Address,
+    pub fee_bps: u32,
 }
 
 #[contracttype]
@@ -21,6 +26,76 @@ pub struct FactoryStorage {
 pub enum DataKey {
     Factory,
     Pair(Address, Address),
+    PendingUpgrade,
+    PairList,
+    /// Per-pair fee override (see `Factory::set_pair_fee`, issue #132).
+    /// Stored as `u32` basis points; absence means "use the pair's dynamic fee".
+    PairFeeOverride(Address),
+    /// Dedicated pair counter kept in strict lockstep with `PairList`.
+    /// A single `u32` read is significantly cheaper than deserialising the
+    /// full `FactoryStorage` blob just to obtain the count.
+    TotalPairs,
+    /// Per-pair frozen flag.
+    PairFrozen(Address),
+    /// Fast boolean lookup for pair membership (issue #391).
+    IsPair(Address),
+    /// Fast boolean lookup for LP-token membership.
+    IsLpToken(Address),
+}
+
+pub fn is_pair_frozen(env: &Env, pair: &Address) -> bool {
+    env.storage().instance().get(&DataKey::PairFrozen(pair.clone())).unwrap_or(false)
+}
+
+pub fn set_pair_frozen(env: &Env, pair: &Address, frozen: bool) {
+    if frozen {
+        env.storage().instance().set(&DataKey::PairFrozen(pair.clone()), &true);
+    } else {
+        env.storage().instance().remove(&DataKey::PairFrozen(pair.clone()));
+    }
+}
+
+pub fn get_pair_list(env: &Env) -> Vec<Address> {
+    env.storage().instance().get(&DataKey::PairList).unwrap_or(Vec::new(env))
+}
+
+pub fn set_pair_list(env: &Env, list: &Vec<Address>) {
+    env.storage().instance().set(&DataKey::PairList, list);
+}
+
+// ---------------------------------------------------------------------------
+// Total-pairs counter (kept in strict lockstep with PairList)
+// ---------------------------------------------------------------------------
+
+/// Returns the cached total-pairs counter. Returns `0` before any pair is
+/// created (i.e. when the key has never been written).
+pub fn get_total_pairs(env: &Env) -> u32 {
+    env.storage().instance().get(&DataKey::TotalPairs).unwrap_or(0u32)
+}
+
+/// Persists the total-pairs counter. Must only be called immediately after
+/// pushing to `PairList` so the two values remain in lockstep.
+pub fn set_total_pairs(env: &Env, count: u32) {
+    env.storage().instance().set(&DataKey::TotalPairs, &count);
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct PendingUpgrade {
+    pub new_wasm_hash: BytesN<32>,
+    pub proposed_at_ledger: u32,
+}
+
+pub fn get_pending_upgrade(env: &Env) -> Option<PendingUpgrade> {
+    env.storage().instance().get(&DataKey::PendingUpgrade)
+}
+
+pub fn set_pending_upgrade(env: &Env, proposal: &PendingUpgrade) {
+    env.storage().instance().set(&DataKey::PendingUpgrade, proposal);
+}
+
+pub fn remove_pending_upgrade(env: &Env) {
+    env.storage().instance().remove(&DataKey::PendingUpgrade);
 }
 
 pub fn get_factory_storage(env: &Env) -> Option<FactoryStorage> {
@@ -45,15 +120,72 @@ pub fn has_factory_storage(env: &Env) -> bool {
     env.storage().instance().has(&DataKey::Factory)
 }
 
+// ---------------------------------------------------------------------------
+// Per-pair fee override (issue #132)
+// ---------------------------------------------------------------------------
+
+/// Returns the per-pair fee override in basis points, or `None` if no override
+/// has been set for `pair`.
+pub fn get_pair_fee_override(env: &Env, pair: &Address) -> Option<u32> {
+    env.storage().instance().get(&DataKey::PairFeeOverride(pair.clone()))
+}
+
+/// Stores the per-pair fee override in basis points. Callers are responsible
+/// for validating that `fee_bps <= 100` (enforced by `Factory::set_pair_fee`).
+pub fn set_pair_fee_override(env: &Env, pair: &Address, fee_bps: u32) {
+    env.storage().instance().set(&DataKey::PairFeeOverride(pair.clone()), &fee_bps);
+}
+
+/// Returns true if the address is a pair created by this factory.
+pub fn is_pair(env: &Env, pair: &Address) -> bool {
+    if env.storage().instance().has(&DataKey::IsPair(pair.clone())) {
+        return env.storage().instance().get(&DataKey::IsPair(pair.clone())).unwrap_or(false);
+    }
+    // Fallback: check pair_list for backwards compatibility or tests
+    let pair_list = get_pair_list(env);
+    for i in 0..pair_list.len() {
+        if pair_list.get(i).unwrap() == *pair {
+            return true;
+        }
+    }
+    false
+}
+
+/// Sets the pair membership flag for an address.
+pub fn set_is_pair(env: &Env, pair: &Address, is_pair: bool) {
+    let key = DataKey::IsPair(pair.clone());
+    if is_pair {
+        env.storage().instance().set(&key, &true);
+    } else {
+        env.storage().instance().remove(&key);
+    }
+}
+
+pub fn is_lp_token(env: &Env, token: &Address) -> bool {
+    env.storage().instance().get(&DataKey::IsLpToken(token.clone())).unwrap_or(false)
+}
+
+pub fn set_is_lp_token(env: &Env, token: &Address, is_lp_token: bool) {
+    let key = DataKey::IsLpToken(token.clone());
+    if is_lp_token {
+        env.storage().instance().set(&key, &true);
+    } else {
+        env.storage().instance().remove(&key);
+    }
+}
+
+/// Removes any per-pair fee override for `pair`, restoring the pair's dynamic
+/// fee. A no-op if no override is currently stored.
+///
+/// `0` is never persisted as an override: a stored `0` is indistinguishable
+/// from "set the swap fee to zero" at the read site, which would let a single
+/// governance call silently zero a pair's fees (issue #311). `None` is the
+/// single encoding for "no override".
+pub fn remove_pair_fee_override(env: &Env, pair: &Address) {
+    env.storage().instance().remove(&DataKey::PairFeeOverride(pair.clone()));
+}
+
 /// Extend instance storage TTL to keep contract alive.
 pub fn extend_instance_ttl(env: &Env) {
     env.storage().instance().extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-}
-
-#[contracttype]
-#[derive(Clone, Debug)]
-pub struct TimelockedAction {
-    pub proposed_at: u64,
-    pub delay_seconds: u64,
-    pub action_id: u32,
 }

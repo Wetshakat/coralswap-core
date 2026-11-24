@@ -18,7 +18,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          targets: wasm32-unknown-unknown
+          toolchain: 1.94.1
+          targets: wasm32v1-none
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
@@ -26,6 +27,23 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: Build
-        run: cargo build --release --target wasm32-unknown-unknown
+        run: cargo build --workspace --exclude coralswap-fuzz --exclude coralswap-integration-tests --release --target wasm32v1-none
       - name: Test
         run: cargo test
+      - name: Fuzz tests
+        run: cargo test -p coralswap-fuzz --features fuzz
+
+  wasm-hash-assertion:
+    name: Assert WASM Hashes
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.1
+          targets: wasm32v1-none
+      - uses: Swatinem/rust-cache@v2
+      - name: Build release WASM artifacts
+        run: cargo build --workspace --exclude coralswap-fuzz --exclude coralswap-integration-tests --release --target wasm32v1-none
+      - name: Assert WASM hashes against deployments metadata
+        run: bash scripts/assert-wasm-hashes.sh

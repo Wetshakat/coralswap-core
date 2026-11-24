@@ -1,16 +1,50 @@
-.PHONY: build test clean fmt lint
+.PHONY: build build-optimized test coverage lint fmt clean deploy-testnet
 
+# Build all contracts (debug profile)
 build:
 	soroban contract build
 
+# Build all contracts with release profile, optimised for WASM deployment.
+# Produces .wasm files in target/wasm32v1-none/release/ ready for
+# on-chain upload.
+build-optimized:
+	cargo build --release --target wasm32v1-none
+
+# Run the full workspace test suite
 test:
 	cargo test
 
-clean:
-	cargo clean
+# Run the test suite under cargo-llvm-cov and enforce the per-member
+# coverage floors recorded in coverage.toml (requires cargo-llvm-cov).
+coverage:
+	./scripts/check-coverage.sh
 
+# Run Clippy with zero-warning policy
+lint:
+	cargo clippy --all-targets -- -D warnings
+
+# Format all source files
 fmt:
 	cargo fmt --all
 
-lint:
-	cargo clippy --all-targets -- -D warnings
+# Remove build artefacts
+clean:
+	cargo clean
+
+# Deploy all contracts to Soroban testnet.
+# Requires SOROBAN_RPC_URL and SOROBAN_NETWORK_PASSPHRASE to be set, and
+# soroban-cli to be installed.
+deploy-testnet: build-optimized
+	@echo "Deploying contracts to testnet..."
+	soroban contract deploy \
+		--wasm target/wasm32v1-none/release/coralswap_factory.wasm \
+		--network testnet
+	soroban contract deploy \
+		--wasm target/wasm32v1-none/release/coralswap_pair.wasm \
+		--network testnet
+	soroban contract deploy \
+		--wasm target/wasm32v1-none/release/coralswap_lp_token.wasm \
+		--network testnet
+	soroban contract deploy \
+		--wasm target/wasm32v1-none/release/coralswap_router.wasm \
+		--network testnet

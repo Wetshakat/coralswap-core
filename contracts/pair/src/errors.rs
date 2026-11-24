@@ -13,10 +13,36 @@ pub enum PairError {
     Locked = 106,
     FlashLoanNotRepaid = 107,
     FlashPayloadTooLarge = 108,
-    Paused = 109,
+    /// Per-contract pause switch — same naming as `LpTokenError::ContractPaused`
+    /// (issue #382; renamed from `Paused` for the shared vocabulary).
+    ContractPaused = 109,
     Overflow = 110,
     ZeroAddress = 111,
     InsufficientLiquidityMinted = 112,
     InsufficientLiquidityBurned = 113,
     InvalidInput = 114,
+    InvalidEmaAlpha = 115,
+    FeeOverflow = 116,
+    FlashCallbackFailed = 117,
+    FlashLoanFeeTooHigh = 118,
+    SlippageExceeded = 119,
+    InvalidStaleThreshold = 120,
+    /// Dust amount below minimum-reserve policy floor (issue 393).
+    DustAmount = 121,
+    /// The pair's LP token is paused, so LP supply cannot change (issue #313).
+    LpTokenPaused = 122,
+    /// The pair's LP token could not be invoked at all (wiring failure).
+    LpTokenUnavailable = 123,
+    /// The LP token refused the call, e.g. the caller is not its admin.
+    LpTokenRejected = 124,
+    /// This pool is frozen by the factory admin (incident response).
+    ContractFrozen = 125,
+}
+
+#[contracterror]
+#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
+#[repr(u32)]
+pub enum OracleError {
+    WindowTooShort = 200,
+    WindowTooLong = 201,
 }

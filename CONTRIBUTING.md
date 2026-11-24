@@ -5,7 +5,7 @@ Thank you for your interest in contributing. This document covers the setup, sta
 ## Prerequisites
 
 - **Rust** (stable) -- install via [rustup](https://rustup.rs/)
-- **wasm32-unknown-unknown target** -- `rustup target add wasm32-unknown-unknown`
+- **wasm32v1-none target** -- `rustup target add wasm32v1-none`
 - **Soroban CLI** -- `cargo install soroban-cli`
 - **Git** with commit signing recommended
 
@@ -57,11 +57,39 @@ refactor(router): extracted deadline validation helper
 
 **Scopes:** `pair`, `factory`, `router`, `lp-token`, `flash`
 
+## Storage Lifetime Rules
+
+Soroban storage is rent-based: any ledger entry that is not extended
+eventually expires and the data is gone. CoralSwap therefore follows a
+written storage-lifetime contract (see
+[`docs/STORAGE_LIFETIMES.md`](docs/STORAGE_LIFETIMES.md)):
+
+- **Any new `storage().set` must be paired with an `extend_ttl` call** on
+  the same entry (or a documented group extension) in the same call path.
+- Instance writes in the core contracts pair with the shared policy helpers
+  (`coralswap_shared::extend_instance_ttl`, `extend_factory_instance_ttl`,
+  `extend_reentrancy_ttl`); LP-token persistent writes pair with the
+  `LP_PERSISTENT_THRESHOLD` / `LP_PERSISTENT_EXTEND_TO` policy.
+- Views never extend TTL; storage-key symbols are stable forever.
+
+## Token Accounting Rules
+
+Reserve-backed amounts must be measured from **balance deltas**, not from the
+nominal amount passed to `transfer` (see
+[Balance-Delta Accounting Rule](ARCHITECTURE.md#balance-delta-accounting-rule)):
+
+- Credit deposits as `balance_after - balance_before` (or
+  `balance - tracked_reserve`).
+- Reconcile stored totals (reserves, stakes, reward pools) against actual
+  balances.
+- New contracts that accept tokens (incentives, governance, staking, ...) must
+  follow this rule and ship a fee-on-transfer / short-delivery test.
+
 ## Pull Request Process
 
 1. Fork the repo and create a branch: `feat/issue-NUMBER-short-description`
 2. Make your changes following the standards above
-3. Ensure CI passes: `cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test`
+3. Ensure CI passes: `cargo fmt --all -- --check && cargo clippy --all-targets -- -D warnings && cargo test && ./scripts/check-coverage.sh`
 4. Open a PR against `main` using the PR template
 5. Reference the issue number in your PR description
 6. Wait for review -- first response within 24 hours
@@ -73,11 +101,91 @@ refactor(router): extracted deadline validation helper
 - Use `soroban_sdk::testutils` for test environments
 - All new functions must have corresponding tests
 
+## Coverage
+
+Every workspace member has an enforced line-coverage floor. The `Coverage`
+workflow runs `./scripts/check-coverage.sh` — a `cargo llvm-cov` run over the
+whole test suite followed by the gate in `scripts/coverage_gate.py` — and fails
+any PR whose member lands below the floor recorded in
+[`coverage.toml`](coverage.toml).
+
+- Run it locally with `make coverage` (needs
+  `cargo install cargo-llvm-cov --locked`; the `llvm-tools-preview` component
+  ships with the pinned toolchain).
+- Floors sit 1--2 pp below the baseline measured when the policy was written,
+  so ordinary refactors pass while a PR that adds uncovered production code --
+  or drops tests from the high-risk paths (flash loan, single-sided mint,
+  reentrancy guard, auth) -- fails with a per-member report in the job summary
+  and as PR annotations. The LCOV and HTML reports are uploaded as the
+  `coverage-report` artifact.
+- A new workspace member must be added to `[floors]`, or to
+  `[no_floor.<member>]` with a `reason`; the gate rejects members that appear
+  in neither table, so nothing escapes the floor silently.
+- Uncovered-but-justified regions are allowlisted in `coverage.toml`, one entry
+  per region, with a mandatory expiry comment:
+
+  ```toml
+  [[exemptions]]
+  path = "contracts/pair/src/storage.rs"
+  lines = "3, 16, 44"
+  reason = "`#[contracttype]` declaration, no executable body"
+  # expires: 2027-03-31
+  ```
+
+  The gate rejects the entry once `today` reaches `expires`, warns 14 days
+  before it, and errors out when the listed lines no longer exist -- so an
+  exemption has to be fixed (tests, dead-code removal) or consciously renewed
+  instead of rotting.
+
+## Continuous Integration
+
+- The `CI` workflow runs formatting, clippy, build, and tests on every push and PR.
+- The `Coverage` workflow (`.github/workflows/coverage.yml`) measures line
+  coverage with `cargo llvm-cov` and enforces the per-member floors in
+  [`coverage.toml`](coverage.toml): a PR below its floor fails with a report in
+  the job summary and as annotations, and the LCOV/HTML report is uploaded as
+  the `coverage-report` artifact. See [Coverage](#coverage).
+- The `SDK Matrix` workflow (`.github/workflows/matrix.yml`) builds and tests the
+  contracts against multiple `soroban-sdk` versions to catch breaking changes early:
+  - The pinned stable version (matching `Cargo.toml`) is **required** to pass.
+  - Newer stable and preview/RC versions are **warn-only** -- their failures are
+    allowed but reported as annotations and in the run summary.
+- Reviewers additionally check the PR template's accounting item: any code that
+  moves tokens into a contract must credit balance deltas, not nominal
+  transfer amounts (see [Token Accounting Rules](#token-accounting-rules)).
+- It also runs on a weekly schedule and via manual `workflow_dispatch`. When adopting
+  a newer SDK, bump the pinned versions in `Cargo.toml` and the matrix entries together.
+
 ## Security
 
 - Never commit secrets, keys, or `.env` files
 - Report vulnerabilities privately via GitHub Security Advisories
 - All token math must use checked arithmetic or validated `i128` ranges
+
+### Soroban Security Model
+
+> **Important:** If you are contributing to any state-mutating function in the
+> `pair` contract — especially functions that make cross-contract calls — read
+> [ARCHITECTURE.md § Soroban Reentrancy Model](ARCHITECTURE.md#soroban-reentrancy-model)
+> before writing or reviewing code.
+
+Soroban's single-frame, copy-on-write execution model is **not** equivalent to
+Solidity's shared mutable world state. Key differences that affect how you
+write safe contract code:
+
+- **No ETH-style implicit callbacks.** Token transfers are explicit
+  cross-contract calls; there is no fallback function to exploit.
+- **Host abort rolls back atomically.** A panicking sub-call discards all
+  writes in the current invocation frame — there is no partial commit to
+  ledger state.
+- **Storage-based reentrancy guard is still required.** Within a single
+  invocation, sub-calls to the same contract observe its current working-set
+  writes. A reentrant call during the flash-loan callback window can observe
+  and exploit intermediate, not-yet-validated state.
+- **RAII lock pattern.** The `ReentrancyGuard` in
+  `contracts/pair/src/reentrancy.rs` uses Rust's `Drop` trait to guarantee
+  unconditional lock release — do not call `release_lock` manually and do not
+  bypass the guard with raw storage writes to `DataKey::Guard`.
 
 ## License
 

@@ -2,16 +2,17 @@
 name = "coralswap-lp-token"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [lib]
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 doctest = false
 
 [dependencies]
 soroban-sdk = { workspace = true }
+coralswap-shared = { path = "../shared" }
 
 [dev-dependencies]
-# Note: testutils feature disabled due to known issue with soroban-sdk 21.7.6
-# The contract compiles successfully and follows SEP-41 standard
-# Integration tests can be performed using soroban CLI
-soroban-sdk = { workspace = true }
+soroban-sdk = { workspace = true, features = ["testutils"] }
+# Scoped-authorization test helpers (issue #314); dev-only, never in release WASM.
+coralswap-shared = { path = "../shared", features = ["test-support"] }

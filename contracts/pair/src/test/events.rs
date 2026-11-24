@@ -26,16 +26,20 @@ impl EventStub {}
 #[test]
 fn swap_event_emits_correct_topics_and_data() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, EventStub);
+    let contract_id = env.register(EventStub, ());
     let sender = Address::generate(&env);
+    let token_a = Address::generate(&env);
+    let token_b = Address::generate(&env);
     let to = Address::generate(&env);
 
     env.as_contract(&contract_id, || {
-        PairEvents::swap(&env, &sender, 100_i128, 0_i128, 0_i128, 99_i128, 30_u32, &to);
+        PairEvents::swap(
+            &env, &sender, &token_a, &token_b, 100_i128, 0_i128, 0_i128, 99_i128, 30_u32, &to,
+        );
     });
 
     let all = env.events().all();
-    assert_eq!(all.len(), 1, "expected exactly one swap event");
+    assert_eq!(all.events().len(), 1, "expected exactly one swap event");
 }
 
 // ---------------------------------------------------------------------------
@@ -44,7 +48,7 @@ fn swap_event_emits_correct_topics_and_data() {
 #[test]
 fn mint_event_emits_correct_topics_and_data() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, EventStub);
+    let contract_id = env.register(EventStub, ());
     let sender = Address::generate(&env);
 
     env.as_contract(&contract_id, || {
@@ -52,7 +56,7 @@ fn mint_event_emits_correct_topics_and_data() {
     });
 
     let all = env.events().all();
-    assert_eq!(all.len(), 1, "expected exactly one mint event");
+    assert_eq!(all.events().len(), 1, "expected exactly one mint event");
 }
 
 // ---------------------------------------------------------------------------
@@ -61,7 +65,7 @@ fn mint_event_emits_correct_topics_and_data() {
 #[test]
 fn burn_event_emits_correct_topics_and_data() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, EventStub);
+    let contract_id = env.register(EventStub, ());
     let sender = Address::generate(&env);
     let to = Address::generate(&env);
 
@@ -70,7 +74,7 @@ fn burn_event_emits_correct_topics_and_data() {
     });
 
     let all = env.events().all();
-    assert_eq!(all.len(), 1, "expected exactly one burn event");
+    assert_eq!(all.events().len(), 1, "expected exactly one burn event");
 }
 
 // ---------------------------------------------------------------------------
@@ -79,14 +83,66 @@ fn burn_event_emits_correct_topics_and_data() {
 #[test]
 fn sync_event_emits_correct_topics_and_data() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, EventStub);
+    let contract_id = env.register(EventStub, ());
 
     env.as_contract(&contract_id, || {
         PairEvents::sync(&env, 10_000_i128, 20_000_i128);
     });
 
     let all = env.events().all();
-    assert_eq!(all.len(), 1, "expected exactly one sync event");
+    assert_eq!(all.events().len(), 1, "expected exactly one sync event");
+}
+
+// ---------------------------------------------------------------------------
+// reward_added
+// ---------------------------------------------------------------------------
+#[test]
+fn reward_added_event_emits_correct_topics_and_data() {
+    let env = Env::default();
+    let contract_id = env.register(EventStub, ());
+    let token = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        PairEvents::reward_added(&env, &token, 1_000_i128);
+    });
+
+    let all = env.events().all();
+    assert_eq!(all.events().len(), 1, "expected exactly one reward_added event");
+}
+
+// ---------------------------------------------------------------------------
+// reward_rate
+// ---------------------------------------------------------------------------
+#[test]
+fn reward_rate_event_emits_correct_topics_and_data() {
+    let env = Env::default();
+    let contract_id = env.register(EventStub, ());
+    let token = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        PairEvents::reward_rate(&env, &token, 100_i128, 200_i128);
+    });
+
+    let all = env.events().all();
+    assert_eq!(all.events().len(), 1, "expected exactly one reward_rate event");
+}
+
+// ---------------------------------------------------------------------------
+// rewards_claimed
+// ---------------------------------------------------------------------------
+#[test]
+fn rewards_claimed_event_emits_correct_topics_and_data() {
+    let env = Env::default();
+    let contract_id = env.register(EventStub, ());
+    let user = Address::generate(&env);
+    let token = Address::generate(&env);
+
+    env.as_contract(&contract_id, || {
+        PairEvents::rewards_claimed(&env, &user, &token, 500_i128);
+    });
+
+    let all = env.events().all();
+    assert_eq!(all.events().len(), 1, "expected exactly one rewards_claimed event");
 }
 
 // ---------------------------------------------------------------------------
@@ -95,15 +151,15 @@ fn sync_event_emits_correct_topics_and_data() {
 #[test]
 fn flash_loan_event_emits_correct_topics_and_data() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, EventStub);
+    let contract_id = env.register(EventStub, ());
     let receiver = Address::generate(&env);
 
     env.as_contract(&contract_id, || {
-        PairEvents::flash_loan(&env, &receiver, 5_000_i128, 0_i128, 25_i128, 0_i128);
+        PairEvents::flash_loan(&env, &receiver, 5_000_i128, 0_i128, 25_i128, 0_i128, 30_u32);
     });
 
     let all = env.events().all();
-    assert_eq!(all.len(), 1, "expected exactly one flash_loan event");
+    assert_eq!(all.events().len(), 1, "expected exactly one flash_loan event");
 }
 
 // ---------------------------------------------------------------------------
@@ -112,7 +168,7 @@ fn flash_loan_event_emits_correct_topics_and_data() {
 #[test]
 fn multiple_events_are_independent() {
     let env = Env::default();
-    let contract_id = env.register_contract(None, EventStub);
+    let contract_id = env.register(EventStub, ());
     let sender = Address::generate(&env);
 
     env.as_contract(&contract_id, || {
@@ -121,5 +177,5 @@ fn multiple_events_are_independent() {
     });
 
     let all = env.events().all();
-    assert_eq!(all.len(), 2, "expected two events in order");
+    assert_eq!(all.events().len(), 2, "expected two events in order");
 }

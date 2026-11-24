@@ -1,12 +1,17 @@
 //! Fixed-point arithmetic helpers for price and reserve calculations.
 //! All values use 1e14 scaling to maintain precision without floating point.
+use ethnum::U256;
+
+use coralswap_shared::QuoteError;
+
+use crate::errors::PairError;
 
 /// Fixed-point scale factor.
 #[allow(dead_code)]
 pub const SCALE: i128 = 100_000_000_000_000; // 1e14
-/// Basis point denominator.
-#[allow(dead_code)]
-pub const BPS_DENOMINATOR: i128 = 10_000;
+/// Basis point denominator (shared with the router so both use one constant).
+#[allow(unused_imports)]
+pub use coralswap_shared::BPS_DENOMINATOR;
 /// Minimum liquidity locked on first mint to prevent division by zero.
 pub const MINIMUM_LIQUIDITY: i128 = 1_000;
 
@@ -16,14 +21,42 @@ pub fn mul_div(a: i128, b: i128, denominator: i128) -> Option<i128> {
     if denominator == 0 {
         return None;
     }
-    // Use u256 intermediate to avoid overflow on large reserves.
-    // TODO: implement with soroban U256 type
-    Some((a * b) / denominator)
+
+    let is_negative = (a < 0) ^ (b < 0) ^ (denominator < 0);
+    let a_abs = U256::from(a.unsigned_abs());
+    let b_abs = U256::from(b.unsigned_abs());
+    let denominator_abs = U256::from(denominator.unsigned_abs());
+
+    let quotient = a_abs.checked_mul(b_abs)?.checked_div(denominator_abs)?;
+
+    let max_positive = U256::from(i128::MAX as u128);
+    let max_negative_magnitude = U256::from(i128::MAX as u128) + U256::ONE;
+
+    if !is_negative {
+        if quotient > max_positive {
+            return None;
+        }
+        return i128::try_from(quotient.as_u128()).ok();
+    }
+
+    if quotient > max_negative_magnitude {
+        return None;
+    }
+
+    if quotient == max_negative_magnitude {
+        return Some(i128::MIN);
+    }
+
+    let magnitude = i128::try_from(quotient.as_u128()).ok()?;
+    Some(-magnitude)
 }
 
 /// Computed integer square root using Newton's method.
 pub fn sqrt(value: i128) -> i128 {
-    if value <= 0 {
+    if value < 0 {
+        panic!("sqrt received negative input");
+    }
+    if value == 0 {
         return 0;
     }
     let mut x = value;
@@ -33,4 +66,229 @@ pub fn sqrt(value: i128) -> i128 {
         y = (x + value / x) / 2;
     }
     x
+}
+
+/// Constant-product output amount (Uniswap V2 style) for a swap of
+/// `amount_in` against reserves `(reserve_in, reserve_out)` with a
+/// basis-point fee `fee_bps`.
+///
+/// Delegates to [`coralswap_shared::quote_output_amount`], the single quote
+/// implementation also used by the router, so pair and router cannot drift.
+///
+/// # Errors
+/// - `PairError::Overflow` on any intermediate arithmetic overflow or an
+///   invalid (>= 100%) fee.
+/// - `PairError::InsufficientLiquidity` if a reserve is not positive.
+/// - `PairError::DustAmount` if the output truncates to zero.
+pub fn get_amount_out(
+    amount_in: i128,
+    reserve_in: i128,
+    reserve_out: i128,
+    fee_bps: u32,
+) -> Result<i128, PairError> {
+    coralswap_shared::quote_output_amount(amount_in, reserve_in, reserve_out, fee_bps).map_err(
+        |err| match err {
+            // A zero input truncates to a zero output: same dust policy as before.
+            QuoteError::ZeroAmount | QuoteError::Dust => PairError::DustAmount,
+            QuoteError::InsufficientLiquidity => PairError::InsufficientLiquidity,
+            QuoteError::Overflow | QuoteError::InvalidFee => PairError::Overflow,
+        },
+    )
+}
+
+/// LP tokens minted for the very first deposit into an empty pool:
+/// `sqrt(amount_a * amount_b) - MINIMUM_LIQUIDITY`.
+///
+/// Returns the raw liquidity value; callers still enforce `> 0`.
+///
+/// # Errors
+/// - `PairError::Overflow` if the product overflows.
+/// - `PairError::InsufficientLiquidityMinted` if subtracting the locked
+///   minimum liquidity underflows (deposit too small).
+pub fn initial_liquidity(amount_a: i128, amount_b: i128) -> Result<i128, PairError> {
+    let product = amount_a.checked_mul(amount_b).ok_or(PairError::Overflow)?;
+    sqrt(product).checked_sub(MINIMUM_LIQUIDITY).ok_or(PairError::InsufficientLiquidityMinted)
+}
+
+/// LP tokens minted for a subsequent proportional deposit given the current
+/// reserves and total LP supply: `min(amount_a * supply / reserve_a,
+/// amount_b * supply / reserve_b)`.
+///
+/// # Errors
+/// - `PairError::Overflow` on multiplication overflow or a zero divisor.
+pub fn subsequent_liquidity(
+    amount_a: i128,
+    amount_b: i128,
+    reserve_a: i128,
+    reserve_b: i128,
+    total_supply: i128,
+) -> Result<i128, PairError> {
+    let liquidity_a = amount_a
+        .checked_mul(total_supply)
+        .ok_or(PairError::Overflow)?
+        .checked_div(reserve_a)
+        .ok_or(PairError::Overflow)?;
+    let liquidity_b = amount_b
+        .checked_mul(total_supply)
+        .ok_or(PairError::Overflow)?
+        .checked_div(reserve_b)
+        .ok_or(PairError::Overflow)?;
+    Ok(liquidity_a.min(liquidity_b))
+}
+
+/// Underlying token amounts returned when burning `lp_amount` LP tokens:
+/// `(lp_amount * reserve_a / supply, lp_amount * reserve_b / supply)`.
+///
+/// # Errors
+/// - `PairError::Overflow` on multiplication overflow or a zero divisor.
+pub fn burn_amounts(
+    lp_amount: i128,
+    reserve_a: i128,
+    reserve_b: i128,
+    total_supply: i128,
+) -> Result<(i128, i128), PairError> {
+    let amount_a = lp_amount
+        .checked_mul(reserve_a)
+        .ok_or(PairError::Overflow)?
+        .checked_div(total_supply)
+        .ok_or(PairError::Overflow)?;
+    let amount_b = lp_amount
+        .checked_mul(reserve_b)
+        .ok_or(PairError::Overflow)?
+        .checked_div(total_supply)
+        .ok_or(PairError::Overflow)?;
+    Ok((amount_a, amount_b))
+}
+
+/// Integer square root for U256 values using Newton's method.
+fn sqrt_u256(value: U256) -> U256 {
+    if value == U256::ZERO {
+        return U256::ZERO;
+    }
+    let mut x = value;
+    let mut y = (x + U256::ONE) / U256::new(2);
+    while y < x {
+        x = y;
+        y = (x + value / x) / U256::new(2);
+    }
+    x
+}
+
+/// Computes the optimal amount of `token_in` to swap before a single-sided
+/// liquidity deposit.
+///
+/// # Problem
+///
+/// A user holds `amount` of one token and wants to add it as liquidity to a
+/// pool with reserves `(reserve_in, reserve_out)`. To mint LP tokens the pool
+/// requires *both* tokens in the current ratio, so the user must first swap
+/// part of their input to obtain the complementary token.
+///
+/// Let `x` be the swap amount. After the swap:
+/// - Pool receives `x` of token_in and releases `y` of token_out.
+/// - Remaining deposit is `(amount - x, y)`.
+/// - For this to be exactly proportional to the *post-swap* reserves
+///   `(reserve_in + x, reserve_out - y)` we need:
+///
+/// ```text
+/// (amount - x) / (reserve_in + x)  ==  y / (reserve_out - y)
+/// ```
+///
+/// Combined with the constant-product swap formula (fee factor `f` in
+/// basis-points, where `f = 10_000 - fee_bps`):
+///
+/// ```text
+/// y = (x * f * reserve_out) / (reserve_in * 10_000 + x * f)
+/// ```
+///
+/// Since `y / (reserve_out - y) = x * f / (reserve_in * 10_000)`, the condition
+/// reduces to the quadratic (in basis points)
+///
+/// ```text
+/// f * x^2 + reserve_in * (10_000 + f) * x - 10_000 * reserve_in * amount = 0
+/// ```
+///
+/// which, with `g = f / 10_000`, is the standard Uniswap-V2 zap
+/// `g*x^2 + r*(1 + g)*x - r*a = 0`. Its positive root is:
+///
+/// ```text
+/// discriminant = reserve_in * (reserve_in * (10_000 + f)^2 + 4 * f * amount * 10_000)
+/// x = ( sqrt(discriminant) - reserve_in * (10_000 + f) ) / (2 * f)
+/// ```
+///
+/// (Using `f` where `10_000 + f` belongs solves `x*g / r = a / (r + x)` instead,
+/// which over-swaps and donates the unbalanced excess to existing LPs.)
+///
+/// All intermediate products can exceed `i128::MAX`, so we work in `U256`.
+///
+/// # Returns
+/// `Ok(swap_in)` — the amount of the input token that should be swapped first.
+///
+/// # Errors
+/// - `PairError::InvalidInput` if any argument is non-positive.
+/// - `PairError::Overflow` if an intermediate computation overflows `U256`.
+pub fn compute_swap_in_for_single_side(
+    reserve_in: i128,
+    amount: i128,
+    fee_bps: u32,
+) -> Result<i128, PairError> {
+    if reserve_in <= 0 || amount <= 0 {
+        return Err(PairError::InvalidInput);
+    }
+
+    // fee_bps is validated upstream to be in 0..=10000 by the dynamic fee
+    // engine, but we guard anyway.
+    if fee_bps > 10_000 {
+        return Err(PairError::InvalidInput);
+    }
+
+    // f = 10_000 - fee_bps  (basis-point fee factor, integer)
+    let f = U256::from(10_000u32 - fee_bps);
+    let bps = U256::new(10_000);
+    let r = U256::from(reserve_in.unsigned_abs());
+    let s = U256::from(amount.unsigned_abs());
+
+    // (1 + g) in basis points
+    let b_plus_f = bps.checked_add(f).ok_or(PairError::Overflow)?;
+
+    // discriminant = r * (r * (10_000 + f)^2 + 4 * f * s * 10_000)
+    let b_plus_f_sq = b_plus_f.checked_mul(b_plus_f).ok_or(PairError::Overflow)?;
+    let r_b_plus_f_sq = r.checked_mul(b_plus_f_sq).ok_or(PairError::Overflow)?;
+    let four_f_s = U256::new(4)
+        .checked_mul(f)
+        .ok_or(PairError::Overflow)?
+        .checked_mul(s)
+        .ok_or(PairError::Overflow)?
+        .checked_mul(bps)
+        .ok_or(PairError::Overflow)?;
+    let inner = r_b_plus_f_sq.checked_add(four_f_s).ok_or(PairError::Overflow)?;
+    let discriminant = r.checked_mul(inner).ok_or(PairError::Overflow)?;
+
+    // numerator = sqrt(discriminant) - r * (10_000 + f)
+    let sqrt_disc = sqrt_u256(discriminant);
+    let r_b_plus_f = r.checked_mul(b_plus_f).ok_or(PairError::Overflow)?;
+
+    if sqrt_disc < r_b_plus_f {
+        // Should not happen for valid positive inputs, but be defensive.
+        return Err(PairError::InvalidInput);
+    }
+    let numerator = sqrt_disc - r_b_plus_f;
+
+    // denominator = 2 * f
+    let denominator = U256::new(2).checked_mul(f).ok_or(PairError::Overflow)?;
+    if denominator == U256::ZERO {
+        // fee_bps == 10_000 (100% fee) — degenerate, refuse
+        return Err(PairError::InvalidInput);
+    }
+
+    let swap_in_u256 = numerator / denominator;
+
+    // Convert back to i128. The result is always <= amount which is i128,
+    // so this should not overflow.
+    let max_i128 = U256::from(i128::MAX as u128);
+    if swap_in_u256 > max_i128 {
+        return Err(PairError::Overflow);
+    }
+
+    Ok(swap_in_u256.as_u128() as i128)
 }

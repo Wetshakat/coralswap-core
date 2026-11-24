@@ -1,20 +1,17 @@
 #![cfg(test)]
 
-use crate::{Pair, PairClient};
-use soroban_sdk::{testutils::Address as _, Address, Bytes, Env, String};
+use coralswap_malicious_flash_receiver::MaliciousFlashReceiver;
+use coralswap_mock_flash_receiver::MockFlashReceiver;
+
+use crate::{errors::PairError, Pair, PairClient};
 use soroban_sdk::token::{StellarAssetClient, TokenClient};
+use soroban_sdk::{testutils::Address as _, Address, Bytes, Env};
 
-// We will test `on_flash_loan` using our newly minted mockup
-// Note: We need to register the mock flash receiver contract in the test environment
-
-mod mock_receiver {
-    soroban_sdk::contractimport!(
-        file = "../../target/wasm32-unknown-unknown/release/coralswap_mock_flash_receiver.wasm"
-    );
-}
-
-fn create_token_contract<'a>(e: &Env, admin: &Address) -> (Address, StellarAssetClient<'a>, TokenClient<'a>) {
-    let contract_id = e.register_stellar_asset_contract(admin.clone());
+fn create_token_contract<'a>(
+    e: &Env,
+    admin: &Address,
+) -> (Address, StellarAssetClient<'a>, TokenClient<'a>) {
+    let contract_id = e.register_stellar_asset_contract_v2(admin.clone()).address();
     (
         contract_id.clone(),
         StellarAssetClient::new(e, &contract_id),
@@ -23,124 +20,368 @@ fn create_token_contract<'a>(e: &Env, admin: &Address) -> (Address, StellarAsset
 }
 
 fn create_pair_contract<'a>(e: &Env) -> (Address, PairClient<'a>) {
-    let contract_id = e.register_contract(None, Pair);
+    let contract_id = e.register(Pair, ());
     (contract_id.clone(), PairClient::new(e, &contract_id))
 }
 
-fn create_mock_receiver<'a>(e: &Env) -> Address {
-    // Register the mock using the WASM
-    e.register_contract_wasm(None, mock_receiver::WASM)
+fn register_honest_receiver(e: &Env) -> Address {
+    e.register(MockFlashReceiver, ())
+}
+
+fn register_malicious_receiver(e: &Env) -> Address {
+    e.register(MaliciousFlashReceiver, ())
 }
 
 struct Setup<'a> {
     env: Env,
-    admin: Address,
-    user: Address,
-    token_a: Address,
     token_a_admin: StellarAssetClient<'a>,
-    token_a_client: TokenClient<'a>,
-    token_b: Address,
     token_b_admin: StellarAssetClient<'a>,
-    token_b_client: TokenClient<'a>,
     pair: Address,
     pair_client: PairClient<'a>,
-    receiver: Address,
+    honest_receiver: Address,
+    malicious_receiver: Address,
 }
 
 impl<'a> Setup<'a> {
     fn new() -> Self {
         let env = Env::default();
+        // BLANKET MOCK (issue #314): this fixture's purpose is flash-loan
+        // math and reentrancy, not authorization. A full tree cannot be built
+        // here because the pair is the LP token's admin and `mock_auths` would
+        // overwrite the pair contract with its mock checker. The guards
+        // themselves are covered by `test::auth_matrix`.
         env.mock_all_auths();
-        
-        let admin = Address::generate(&env);
-        let user = Address::generate(&env);
 
-        let (token_a, token_a_admin, token_a_client) = create_token_contract(&env, &admin);
-        let (token_b, token_b_admin, token_b_client) = create_token_contract(&env, &admin);
-        
-        // Ensure token_a < token_b lexicographically for standard setup
-        let (token_a, token_a_admin, token_a_client, token_b, token_b_admin, token_b_client) =
-            if token_a < token_b {
-                (token_a, token_a_admin, token_a_client, token_b, token_b_admin, token_b_client)
-            } else {
-                (token_b, token_b_admin, token_b_client, token_a, token_a_admin, token_a_client)
-            };
+        let admin = Address::generate(&env);
+
+        let (token_a, token_a_admin, _) = create_token_contract(&env, &admin);
+        let (token_b, token_b_admin, _) = create_token_contract(&env, &admin);
+
+        let (token_a, token_a_admin, token_b, token_b_admin) = if token_a < token_b {
+            (token_a, token_a_admin, token_b, token_b_admin)
+        } else {
+            (token_b, token_b_admin, token_a, token_a_admin)
+        };
 
         let (pair, pair_client) = create_pair_contract(&env);
-        let receiver = create_mock_receiver(&env);
+        let honest_receiver = register_honest_receiver(&env);
+        let malicious_receiver = register_malicious_receiver(&env);
 
         let factory = Address::generate(&env);
-        let lp_token = Address::generate(&env); // Fake LP for now, maybe we need a real one
+        let lp_token = Address::generate(&env);
 
         pair_client.initialize(&factory, &token_a, &token_b, &lp_token);
 
         Setup {
             env,
-            admin,
-            user,
-            token_a,
             token_a_admin,
-            token_a_client,
-            token_b,
             token_b_admin,
-            token_b_client,
             pair,
             pair_client,
-            receiver,
+            honest_receiver,
+            malicious_receiver,
         }
+    }
+
+    fn fund_pool(&self, amount: i128) {
+        self.token_a_admin.mint(&self.pair, &amount);
+        self.token_b_admin.mint(&self.pair, &amount);
+        self.pair_client.sync();
     }
 }
 
+fn is_reentrancy_error(
+    result: Result<
+        Result<(), soroban_sdk::ConversionError>,
+        Result<PairError, soroban_sdk::InvokeError>,
+    >,
+) -> bool {
+    match result {
+        Err(_) => true,
+        Ok(Err(_)) => true,
+        Ok(Ok(())) => false,
+    }
+}
+
+// Scenario C — honest receiver repays principal + fee (regression baseline)
 #[test]
-fn test_flash_loan_repay() {
+fn flash_loan_honest_receiver_repays() {
     let setup = Setup::new();
-    
-    // Add liquidity to pair
-    let initial_reserve = 1_000_000;
-    setup.token_a_admin.mint(&setup.pair, &initial_reserve);
-    setup.token_b_admin.mint(&setup.pair, &initial_reserve);
-    setup.pair_client.sync();
+    let initial_reserve = 1_000_000_i128;
+    setup.fund_pool(initial_reserve);
 
-    let loan_amount = 10_000;
-    let fee = crate::flash_loan::compute_flash_fee(loan_amount, 30); // Returns max(30, 5) base
+    let loan_amount = 10_000_i128;
+    let fee = crate::flash_loan::compute_flash_fee(loan_amount, 30).unwrap();
 
-    // Fund the receiver with enough tokens to pay the fee!
-    setup.token_a_admin.mint(&setup.receiver, &fee);
-    setup.token_b_admin.mint(&setup.receiver, &(fee as i128)); // Cast just for simplicity
+    setup.token_a_admin.mint(&setup.honest_receiver, &fee);
 
     let repay_action = Bytes::from_slice(&setup.env, b"repay");
+    setup.pair_client.flash_loan(&setup.honest_receiver, &loan_amount, &0, &repay_action);
 
-    setup.pair_client.flash_loan(
-        &setup.receiver,
-        &loan_amount,
-        &0, 
-        &repay_action,
-    );
-    
-    // Check invariants... reserves should have increased by fee
     let (res_a, res_b, _) = setup.pair_client.get_reserves();
     assert_eq!(res_a, initial_reserve + fee);
     assert_eq!(res_b, initial_reserve);
 }
 
+// Scenario C3 — receiver repays MORE than principal + fee (overpayment path).
+// The surplus is accepted and credited to the pool: `execute_flash_loan` sets
+// the reserves to the post-callback balances, so an overpayment grows `k` and
+// accrues to LPs instead of being refunded or reverted.
 #[test]
-#[should_panic(expected = "HostError: Error(Value, InvalidInput)")]
-fn test_flash_loan_steal() {
+fn flash_loan_overpayment_is_credited_to_pool() {
     let setup = Setup::new();
-    
-    let initial_reserve = 1_000_000;
-    setup.token_a_admin.mint(&setup.pair, &initial_reserve);
-    setup.token_b_admin.mint(&setup.pair, &initial_reserve);
-    setup.pair_client.sync();
+    let initial_reserve = 1_000_000_i128;
+    setup.fund_pool(initial_reserve);
 
-    let steal_action = Bytes::from_slice(&setup.env, b"steal");
+    let loan_amount = 10_000_i128;
+    let fee = crate::flash_loan::compute_flash_fee(loan_amount, 30).unwrap();
+    // The `overpay` plan donates the principal a second time.
+    let surplus = loan_amount;
+    setup.token_a_admin.mint(&setup.honest_receiver, &(loan_amount + fee + surplus));
 
-    // This should panic due to FlashLoanNotRepaid
-    setup.pair_client.flash_loan(
-        &setup.receiver,
-        &10_000,
-        &0, 
-        &steal_action,
+    let overpay_action = Bytes::from_slice(&setup.env, b"overpay");
+    setup.pair_client.flash_loan(&setup.honest_receiver, &loan_amount, &0, &overpay_action);
+
+    let (res_a, res_b, _) = setup.pair_client.get_reserves();
+    assert_eq!(res_a, initial_reserve + fee + surplus);
+    assert_eq!(res_b, initial_reserve);
+}
+
+// Scenario C4 — dual-token overpayment: the surplus of *both* borrowed tokens
+// is credited, and the k-invariant (which only ever grows here) still holds.
+#[test]
+fn flash_loan_dual_overpayment_is_credited_to_pool() {
+    let setup = Setup::new();
+    let initial_reserve = 1_000_000_i128;
+    setup.fund_pool(initial_reserve);
+
+    let loan_a = 10_000_i128;
+    let loan_b = 4_000_i128;
+    let fee_a = crate::flash_loan::compute_flash_fee(loan_a, 30).unwrap();
+    let fee_b = crate::flash_loan::compute_flash_fee(loan_b, 30).unwrap();
+    // The `overpay` plan donates the borrowed principal a second time.
+    setup.token_a_admin.mint(&setup.honest_receiver, &(loan_a + fee_a + loan_a));
+    setup.token_b_admin.mint(&setup.honest_receiver, &(loan_b + fee_b + loan_b));
+
+    let overpay_action = Bytes::from_slice(&setup.env, b"overpay");
+    setup.pair_client.flash_loan(&setup.honest_receiver, &loan_a, &loan_b, &overpay_action);
+
+    let (res_a, res_b, _) = setup.pair_client.get_reserves();
+    assert_eq!(res_a, initial_reserve + fee_a + loan_a);
+    assert_eq!(res_b, initial_reserve + fee_b + loan_b);
+    assert!(res_a * res_b > initial_reserve * initial_reserve);
+}
+
+// Scenario D — receiver repays LESS than principal + fee (underpayment path).
+// A single stroop short of the required fee must abort the whole loan with
+// `FlashLoanNotRepaid`; the host discards the frame, so the pool keeps both its
+// principal and its reserves and the reentrancy guard is never left locked.
+#[test]
+fn flash_loan_underpayment_reverts_with_flash_loan_not_repaid() {
+    let setup = Setup::new();
+    setup.fund_pool(1_000_000);
+    let (reserve_a_before, reserve_b_before, _) = setup.pair_client.get_reserves();
+
+    let loan_amount = 10_000_i128;
+    let fee = crate::flash_loan::compute_flash_fee(loan_amount, 30).unwrap();
+    // The `underpay` plan repays one stroop less than `amount + fee`.
+    setup.token_a_admin.mint(&setup.honest_receiver, &(loan_amount + fee - 1));
+
+    let underpay_action = Bytes::from_slice(&setup.env, b"underpay");
+    let result = setup.pair_client.try_flash_loan(
+        &setup.honest_receiver,
+        &loan_amount,
+        &0,
+        &underpay_action,
+    );
+
+    match result {
+        Err(Ok(PairError::FlashLoanNotRepaid)) => {}
+        other => panic!("expected FlashLoanNotRepaid, got {:?}", other),
+    }
+
+    // A short repayment is rolled back entirely — the pool is made whole.
+    let (reserve_a_after, reserve_b_after, _) = setup.pair_client.get_reserves();
+    assert_eq!(reserve_a_after, reserve_a_before);
+    assert_eq!(reserve_b_after, reserve_b_before);
+
+    // The guard must be released; an honest loan still works afterwards
+    let fee = crate::flash_loan::compute_flash_fee(1_000, 30).unwrap();
+    setup.token_a_admin.mint(&setup.honest_receiver, &(1_000 + fee));
+    let repay_action = Bytes::from_slice(&setup.env, b"repay");
+    assert_eq!(
+        setup.pair_client.try_flash_loan(&setup.honest_receiver, &1_000, &0, &repay_action),
+        Ok(Ok(()))
     );
 }
 
+// Scenario A — malicious receiver calls pair::swap() during flash callback
+#[test]
+fn flash_loan_reentrancy_swap_attack_reverts() {
+    let setup = Setup::new();
+    setup.fund_pool(1_000_000);
+
+    let attack = Bytes::from_slice(&setup.env, b"attack_swap");
+    let result = setup.pair_client.try_flash_loan(&setup.malicious_receiver, &10_000, &0, &attack);
+
+    assert!(
+        is_reentrancy_error(result),
+        "swap re-entry during flash callback must revert with Locked or equivalent"
+    );
+}
+
+// Scenario B — malicious receiver nests flash_loan() during callback
+#[test]
+fn flash_loan_reentrancy_nested_flash_attack_reverts() {
+    let setup = Setup::new();
+    setup.fund_pool(1_000_000);
+
+    let attack = Bytes::from_slice(&setup.env, b"attack_flash");
+    let result = setup.pair_client.try_flash_loan(&setup.malicious_receiver, &10_000, &0, &attack);
+
+    assert!(is_reentrancy_error(result), "nested flash_loan during callback must revert cleanly");
+}
+
+// Scenario C2 — receiver's callback reverts on its own; the pair must
+// propagate the failure instead of treating the callback as successful
+#[test]
+fn flash_loan_failing_callback_reverts_with_flash_callback_failed() {
+    let setup = Setup::new();
+    setup.fund_pool(1_000_000);
+    let (reserve_a_before, reserve_b_before, _) = setup.pair_client.get_reserves();
+
+    let attack = Bytes::from_slice(&setup.env, b"attack_fail");
+    let result = setup.pair_client.try_flash_loan(&setup.malicious_receiver, &10_000, &0, &attack);
+
+    match result {
+        Err(Ok(PairError::FlashCallbackFailed)) => {}
+        other => panic!("expected FlashCallbackFailed, got {:?}", other),
+    }
+
+    // Reserves must be untouched: a failed callback is not a repaid loan
+    let (reserve_a_after, reserve_b_after, _) = setup.pair_client.get_reserves();
+    assert_eq!(reserve_a_after, reserve_a_before);
+    assert_eq!(reserve_b_after, reserve_b_before);
+
+    // The guard must be released; an honest loan still works afterwards
+    let fee = crate::flash_loan::compute_flash_fee(1_000, 30).unwrap();
+    setup.token_a_admin.mint(&setup.honest_receiver, &(1_000 + fee));
+    let repay_action = Bytes::from_slice(&setup.env, b"repay");
+    assert_eq!(
+        setup.pair_client.try_flash_loan(&setup.honest_receiver, &1_000, &0, &repay_action),
+        Ok(Ok(()))
+    );
+}
+
+#[test]
+fn test_compute_flash_fee_overflow_returns_error() {
+    let result = crate::flash_loan::compute_flash_fee(i128::MAX, 30);
+    assert_eq!(result, Err(PairError::FeeOverflow));
+}
+
+#[test]
+fn test_compute_flash_fee_normal_amount() {
+    let result = crate::flash_loan::compute_flash_fee(10_000, 30);
+    assert!(result.is_ok());
+    assert!(result.unwrap() > 0);
+}
+
+#[test]
+fn test_compute_flash_fee_cap_boundary_valid() {
+    let result = crate::flash_loan::compute_flash_fee(10_000, 10_000);
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), 10_000);
+}
+
+#[test]
+fn test_compute_flash_fee_cap_boundary_invalid() {
+    let result = crate::flash_loan::compute_flash_fee(10_000, 10_001);
+    assert_eq!(result, Err(PairError::FlashLoanFeeTooHigh));
+}
+
+#[test]
+fn test_compute_flash_fee_excessive_fee() {
+    let result = crate::flash_loan::compute_flash_fee(10_000, 15_000);
+    assert_eq!(result, Err(PairError::FlashLoanFeeTooHigh));
+}
+
+#[test]
+fn test_flash_loan_zero_amount_clean_noop() {
+    let setup = Setup::new();
+    setup.fund_pool(100_000);
+
+    let (res_a_before, res_b_before, _) = setup.pair_client.get_reserves();
+
+    // Using malicious_receiver whose callback would attempt an unauthorized attack if invoked.
+    // Since amount is (0, 0), the callback is never invoked and returns Ok(()).
+    let attack = Bytes::from_slice(&setup.env, b"swap");
+    let result = setup.pair_client.try_flash_loan(&setup.malicious_receiver, &0, &0, &attack);
+    assert_eq!(result, Ok(Ok(())));
+
+    // Reserves remain unchanged.
+    let (res_a_after, res_b_after, _) = setup.pair_client.get_reserves();
+    assert_eq!(res_a_before, res_a_after);
+    assert_eq!(res_b_before, res_b_after);
+}
+
+#[test]
+fn test_flash_loan_zero_amount_fails_if_payload_too_large() {
+    let setup = Setup::new();
+    let mut large_bytes = [0u8; 257];
+    large_bytes[0] = 1;
+    let large_data = Bytes::from_slice(&setup.env, &large_bytes);
+
+    let result = setup.pair_client.try_flash_loan(&setup.honest_receiver, &0, &0, &large_data);
+    assert_eq!(result, Err(Ok(PairError::FlashPayloadTooLarge)));
+}
+
+#[test]
+fn test_flash_loan_zero_amount_fails_if_uninitialized() {
+    let env = Env::default();
+    let (_pair_id, pair_client) = create_pair_contract(&env);
+    let receiver = Address::generate(&env);
+
+    let result = pair_client.try_flash_loan(&receiver, &0, &0, &Bytes::new(&env));
+    assert_eq!(result, Err(Ok(PairError::NotInitialized)));
+}
+
+#[test]
+fn test_flash_loan_negative_amount_fails() {
+    let setup = Setup::new();
+    setup.fund_pool(100_000);
+    let data = Bytes::new(&setup.env);
+
+    let result_neg_a = setup.pair_client.try_flash_loan(&setup.honest_receiver, &-1, &0, &data);
+    assert_eq!(result_neg_a, Err(Ok(PairError::InsufficientInputAmount)));
+
+    let result_neg_b = setup.pair_client.try_flash_loan(&setup.honest_receiver, &0, &-1, &data);
+    assert_eq!(result_neg_b, Err(Ok(PairError::InsufficientInputAmount)));
+}
+
+// ── Zero-fee semantics (0-bps pools) ────────────────────────────────────────
+
+#[test]
+fn compute_flash_fee_zero_bps_quotes_zero() {
+    assert_eq!(crate::flash_loan::compute_flash_fee(1, 0), Ok(0));
+    assert_eq!(crate::flash_loan::compute_flash_fee(1_000_000, 0), Ok(0));
+    assert_eq!(crate::flash_loan::compute_flash_fee(i128::MAX, 0), Ok(0));
+}
+
+#[test]
+fn compute_flash_fee_nonzero_bps_applies_floor_and_one_stroop_minimum() {
+    // 1 bps is below the 5 bps floor → floor applies.
+    assert_eq!(crate::flash_loan::compute_flash_fee(1_000_000, 1), Ok(500));
+    // Rounds to zero at the floor rate → 1-stroop minimum applies.
+    assert_eq!(crate::flash_loan::compute_flash_fee(1, 1), Ok(1));
+    assert_eq!(crate::flash_loan::compute_flash_fee(1, 30), Ok(1));
+    // Above the floor → pool rate applies.
+    assert_eq!(crate::flash_loan::compute_flash_fee(1_000_000, 30), Ok(3_000));
+}
+
+#[test]
+fn compute_flash_fee_rejects_fee_above_100_percent() {
+    assert_eq!(
+        crate::flash_loan::compute_flash_fee(1_000, 10_001),
+        Err(PairError::FlashLoanFeeTooHigh)
+    );
+}

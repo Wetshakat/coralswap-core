@@ -14,4 +14,18 @@ pub enum RouterError {
     InsufficientLiquidity = 307,
     SlippageExceeded = 308,
     InternalError = 309,
+    CommitNotFound = 310,
+    CommitRevealTooEarly = 311,
+    CommitHashMismatch = 312,
+    NonceAlreadyUsed = 313,
+    /// Dust amount below minimum-reserve policy floor (issue 393).
+    DustAmount = 314,
+    /// Commit expired past its reveal window (issue 389).
+    CommitExpired = 315,
+    /// Too many live commits (issue 389).
+    TooManyCommits = 316,
+    /// Invalid commit-config values (issue 389).
+    InvalidCommitConfig = 317,
+    /// Token ordering doesn't match pair's canonical order (issue #357).
+    InvalidTokenOrder = 318,
 }

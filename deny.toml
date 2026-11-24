@@ -1,0 +1,73 @@
+# cargo-deny configuration for dependency auditing
+# https://embarkstudios.github.io/cargo-deny/
+
+[advisories]
+# The path where the advisory database is cloned/fetched into
+db-path = "~/.cargo/advisory-db"
+# The url(s) of the advisory databases to use
+db-urls = ["https://github.com/rustsec/advisory-db"]
+# Unmaintained advisories fail the check for direct dependencies of
+# workspace crates; transitive ones are reported but do not block
+unmaintained = "workspace"
+# Fail the check when a dependency version has been yanked from its registry
+yanked = "deny"
+# Ignore specific advisories
+ignore = [
+    # RUSTSEC-2026-0387: timing side-channels in crypto-bigint v0.5.5.
+    # This is a transitive dependency pulled in by soroban-env-host v27.0.1
+    # via k256/elliptic-curve; it cannot be resolved by bumping our own
+    # dependencies. The fix (crypto-bigint >= 0.7.6) must come from a future
+    # soroban-sdk release. CoralSwap contracts do not call any of the affected
+    # operations (subtraction, Montgomery mul, inversion) directly — the
+    # exposure is limited to the host's ed25519/k256 signature verification
+    # which is not part of our production code paths.
+    # Re-evaluate when soroban-sdk bumps soroban-env-host past this advisory.
+    "RUSTSEC-2026-0387",
+]
+
+[licenses]
+# List of explicitly allowed licenses
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Unicode-3.0",
+    "Zlib",
+]
+# Anything not in the allow list above is denied
+# The confidence threshold for detecting a license from license text
+confidence-threshold = 0.8
+
+[bans]
+# Lint level for when multiple versions of the same crate are detected
+multiple-versions = "warn"
+# Lint level for when a crate version requirement is `*`
+wildcards = "warn"
+# The graph highlighting used when creating dotgraphs for crates
+highlight = "all"
+# List of crates that are allowed
+allow = []
+# List of crates to deny
+deny = [
+    # Add known malicious or problematic crates here
+]
+# Skip certain crates from duplicate version detection
+skip = []
+# Skip tree-root crates from being duplicated
+skip-tree = []
+
+[sources]
+# Lint level for what to happen when a crate from a crate registry that is not in the allow list is encountered
+unknown-registry = "warn"
+# Lint level for what to happen when a crate from a git repository that is not in the allow list is encountered
+unknown-git = "warn"
+# List of allowed crate registries
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# List of allowed Git repositories
+allow-git = []
+
+[sources.allow-org]
+# GitHub organizations to allow
+github = []

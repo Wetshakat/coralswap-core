@@ -4,11 +4,41 @@ members = [
     "contracts/pair",
     "contracts/lp_token",
     "contracts/router",
+    "contracts/shared",
+    "contracts/staking",
     "contracts/flash_receiver_interface",
-    "contracts/mock_flash_receiver"
+    "contracts/mock_flash_receiver",
+    "contracts/malicious_flash_receiver",
+    "tests/fuzz",
+    "tests"
+]
+# `tests/fuzz` requires `std` and is built/run only via its own explicit
+# `-p coralswap-fuzz` invocation (see the "Fuzz tests" CI step) — it isn't a
+# `no_std` wasm contract crate, so it must stay out of default-members or an
+# unscoped `cargo build --target wasm32*` across the workspace fails on it.
+default-members = [
+    "contracts/factory",
+    "contracts/pair",
+    "contracts/lp_token",
+    "contracts/router",
+    "contracts/shared",
+    "contracts/staking",
+    "contracts/flash_receiver_interface",
+    "contracts/mock_flash_receiver",
+    "contracts/malicious_flash_receiver",
+    "tests",
 ]
 resolver = "2"
 
 [workspace.dependencies]
-soroban-sdk = "=21.7.7"
-soroban-token-sdk = "=21.7.7"
+soroban-sdk = "27.0.2"
+soroban-token-sdk = "27.0.2"
+soroban-env-common = "27.0.2"
+soroban-env-host = "27.0.2"
+soroban-env-guest = "27.0.2"
+ethnum = "1.5.3"
+
+[profile.release]
+overflow-checks = true
+opt-level = "z"
+debug = false
